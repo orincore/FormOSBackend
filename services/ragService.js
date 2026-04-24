@@ -46,6 +46,7 @@ ANSWER:`;
       extractedData.middleName,
       extractedData.lastName,
     ].filter(Boolean).join(' ').trim();
+    // Fall back to auth-level name/email/phone if not in extractedData
     const normalizedName = extractedData.fullName || derivedName || userData.name || '';
     const normalizedEmail = extractedData.email || userData.email || '';
     const normalizedPhone = extractedData.phone || userData.phone || '';
@@ -139,6 +140,21 @@ ANSWER:`;
       Object.entries(profile.customFields).forEach(([key, value]) => {
         if (value !== undefined && value !== null && value !== '') {
           context += `${key}: ${value}\n`;
+        }
+      });
+    }
+
+    // Include text extracted from recently uploaded documents
+    const recentDocs = userData._recentDocuments;
+    if (recentDocs && recentDocs.length > 0) {
+      context += '\nRecently Uploaded Documents:\n';
+      recentDocs.forEach((doc) => {
+        context += `\n--- ${doc.originalName} ---\n`;
+        if (doc.extractedText) {
+          // Include up to 1000 chars of extracted text per doc
+          context += doc.extractedText.substring(0, 1000);
+          if (doc.extractedText.length > 1000) context += '...(truncated)';
+          context += '\n';
         }
       });
     }

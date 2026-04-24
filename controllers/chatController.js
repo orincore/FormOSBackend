@@ -1,5 +1,6 @@
 const ragService = require('../services/ragService');
 const User = require('../models/User');
+const Document = require('../models/Document');
 
 exports.chat = async (req, res) => {
   try {
@@ -12,16 +13,24 @@ exports.chat = async (req, res) => {
       });
     }
 
-    // Get user data
+    // Get fresh user data
     const user = await User.findById(req.userId);
 
-    // Query using RAG
+    // Attach recent completed document extractions so RAG has full context
+    const recentDocs = await Document.find({
+      userId: req.userId,
+      ocrStatus: 'completed',
+      extractedText: { $exists: true, $ne: '' }
+    })
+      .sort({ uploadedAt: -1 })
+      .limit(5)
+      .select('originalName extractedText structuredData uploadedAt');
+
+    user._recentDocuments = recentDocs;
+
     const response = await ragService.queryUserData(message, user);
 
-    res.json({
-      success: true,
-      response
-    });
+    res.json({ success: true, response });
   } catch (error) {
     console.error('Chat error:', error);
     if (error.message === 'AI service is not configured') {
