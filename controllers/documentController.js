@@ -1,5 +1,6 @@
 const fs = require('fs').promises;
 const path = require('path');
+const os = require('os');
 const Document = require('../models/Document');
 const User = require('../models/User');
 const ocrService = require('../services/ocrService');
@@ -72,8 +73,7 @@ async function processOCR(documentId, filePathOrKey, userId, useS3 = false) {
 
     if (useS3) {
       const fileBuffer = await downloadFromS3(filePathOrKey);
-      const tempDir = process.env.UPLOAD_DIR || './uploads';
-      tempFilePath = path.join(tempDir, `temp-${Date.now()}-${path.basename(filePathOrKey)}`);
+      tempFilePath = path.join(os.tmpdir(), `temp-${Date.now()}-${path.basename(filePathOrKey)}`);
       await fs.writeFile(tempFilePath, fileBuffer);
       filePath = tempFilePath;
     }

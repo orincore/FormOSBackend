@@ -9,6 +9,9 @@ const app = express();
 // Connect to MongoDB
 connectDB();
 
+// Trust proxy (required when running behind Render/nginx/load balancers)
+app.set('trust proxy', 1);
+
 // Middleware
 app.use(helmet());
 const ALLOWED_ORIGINS = [
