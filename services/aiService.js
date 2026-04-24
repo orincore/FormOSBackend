@@ -64,49 +64,55 @@ class AIService {
 
   async chatWithOpenRouter(systemPrompt, userPrompt) {
     try {
-      console.log('OpenRouter: Sending request with model:', process.env.OPENROUTER_MODEL);
+      const model = process.env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-exp:free';
+      console.log('OpenRouter: Sending request with model:', model);
       
       const response = await this.openrouter.chat.completions.create({
-        model: process.env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-exp:free',
+        model,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }
         ],
         temperature: 0.3,
-        max_tokens: 500
+        max_tokens: 2000,
       });
 
       console.log('OpenRouter: Response received:', {
         id: response.id,
         model: response.model,
-        hasChoices: !!response.choices,
-        choicesLength: response.choices?.length
+        choicesLength: response.choices?.length,
       });
 
-      const content = response.choices[0]?.message?.content;
-      
+      const choice = response.choices?.[0];
+      const message = choice?.message;
+
+      // Standard content field
+      let content = message?.content;
+
+      // Some reasoning models (e.g. deepseek-r1, nemotron) put the final answer
+      // in message.reasoning or a non-standard text field when content is empty
+      if (!content && message?.reasoning) {
+        content = message.reasoning;
+      }
+
+      // OpenRouter sometimes wraps it in a non-standard `text` array
+      if (!content && Array.isArray(message?.content)) {
+        const textBlock = message.content.find((b) => b.type === 'text');
+        if (textBlock) content = textBlock.text;
+      }
+
       if (!content) {
         console.error('OpenRouter returned empty content. Full response:', JSON.stringify(response, null, 2));
         throw new Error('OpenRouter returned empty response');
       }
-      
+
       console.log('OpenRouter: Content length:', content.length);
       return content;
     } catch (error) {
-      console.error('OpenRouter API Error Details:');
-      console.error('- Message:', error.message);
-      console.error('- Status:', error.status);
-      console.error('- Code:', error.code);
-      
+      console.error('OpenRouter API Error:', error.message);
       if (error.response) {
-        console.error('- Response status:', error.response.status);
-        console.error('- Response data:', JSON.stringify(error.response.data, null, 2));
+        console.error('Response data:', JSON.stringify(error.response.data, null, 2));
       }
-      
-      if (error.error) {
-        console.error('- Error object:', JSON.stringify(error.error, null, 2));
-      }
-      
       throw new Error(`OpenRouter API failed: ${error.message}`);
     }
   }

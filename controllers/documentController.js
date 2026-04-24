@@ -266,13 +266,32 @@ exports.deleteDocument = async (req, res) => {
       });
     }
 
+    // Delete from S3 or local filesystem
     if (document.storageType === 's3' && document.s3Key) {
-      await deleteFromS3(document.s3Key).catch(console.error);
-    } else {
-      await fs.unlink(document.filePath).catch(console.error);
+      await deleteFromS3(document.s3Key).catch((err) =>
+        console.error('S3 delete error (non-fatal):', err.message)
+      );
+    } else if (document.filePath) {
+      await fs.unlink(document.filePath).catch((err) =>
+        console.error('Local file delete error (non-fatal):', err.message)
+      );
     }
 
+    // Remove from DB
     await document.deleteOne();
+
+    // Rebuild user extractedData from remaining documents so profile stays accurate
+    const remainingDocs = await Document.find({
+      userId: req.userId,
+      ocrStatus: 'completed',
+    }).select('structuredData');
+
+    const merged = {};
+    for (const doc of remainingDocs) {
+      if (doc.structuredData) Object.assign(merged, doc.structuredData);
+    }
+
+    await User.findByIdAndUpdate(req.userId, { extractedData: merged });
 
     return res.json({
       success: true,
