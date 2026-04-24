@@ -3,6 +3,7 @@ const formAnalyzerService = require('../services/formAnalyzerService');
 const { isS3Configured, downloadFromS3 } = require('../services/s3Service');
 const fs = require('fs').promises;
 const path = require('path');
+const os = require('os');
 
 /**
  * Analyze form - handles both file upload and mock fields
@@ -42,12 +43,11 @@ exports.analyzeForm = async (req, res) => {
       let tempFilePath = null;
 
       try {
-        // If using S3, download file temporarily
+        // If using S3, download file temporarily to os.tmpdir()
         if (useS3) {
           console.log('Using S3 storage, downloading file...');
           const fileBuffer = await downloadFromS3(req.file.key);
-          const tempDir = process.env.UPLOAD_DIR || './uploads';
-          tempFilePath = path.join(tempDir, `temp-${Date.now()}-${path.basename(req.file.key)}`);
+          tempFilePath = path.join(os.tmpdir(), `temp-${Date.now()}-${path.basename(req.file.key)}`);
           await fs.writeFile(tempFilePath, fileBuffer);
           filePath = tempFilePath;
         } else {
