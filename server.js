@@ -11,9 +11,23 @@ connectDB();
 
 // Middleware
 app.use(helmet());
+const ALLOWED_ORIGINS = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'https://formos.online',
+  'https://www.formos.online',
+  'https://api.formos.online',
+  ...(process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()) : []),
+];
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
-  credentials: true
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, Postman)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  credentials: true,
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -25,6 +39,7 @@ app.use('/api/chat', require('./routes/chat'));
 app.use('/api/autofill', require('./routes/autofill'));
 app.use('/api/form-analyzer', require('./routes/formAnalyzer'));
 app.use('/api/eligibility', require('./routes/eligibility'));
+app.use('/api/merged-profile', require('./routes/merge'));
 
 // Health check
 app.get('/health', (req, res) => {
