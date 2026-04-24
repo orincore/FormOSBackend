@@ -224,6 +224,7 @@ const splitAutofillPayload = (data = {}, includeSensitive = false) => {
     firstName: data.firstName || '',
     lastName: data.lastName || '',
     address: data.address || '',
+    dateOfBirth: data.dateOfBirth || '',
   };
 
   if (!includeSensitive) {
@@ -239,7 +240,6 @@ const splitAutofillPayload = (data = {}, includeSensitive = false) => {
       ...safePayload,
       email: data.email || '',
       phone: data.phone || '',
-      dateOfBirth: data.dateOfBirth || '',
       aadhaar: data.aadhaar || '',
       pan: data.pan || '',
     },

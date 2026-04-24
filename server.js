@@ -44,6 +44,7 @@ app.use('/api/chat', require('./routes/chat'));
 app.use('/api/autofill', require('./routes/autofill'));
 app.use('/api/form-analyzer', require('./routes/formAnalyzer'));
 app.use('/api/eligibility', require('./routes/eligibility'));
+app.use('/api/extension', require('./routes/extension'));
 
 // Health check
 app.get('/health', (req, res) => {
