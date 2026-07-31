@@ -3,7 +3,8 @@ const User = require('../models/User');
 const AuthSession = require('../models/AuthSession');
 const PendingRegistration = require('../models/PendingRegistration');
 const LoginOtpChallenge = require('../models/LoginOtpChallenge');
-const { sendVerificationEmail } = require('../services/emailService');
+const PasswordReset = require('../models/PasswordReset');
+const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/emailService');
 const {
   buildQrCodeDataUrl,
   compareHashedValue,
@@ -1047,5 +1048,222 @@ exports.verifyLoginOtp = async (req, res) => {
   } catch (error) {
     console.error('Verify login OTP error:', error.message);
     return res.status(500).json({ success: false, message: 'Unable to verify OTP' });
+  }
+};
+
+
+// ── Forgot Password ──────────────────────────────────────────────────────────
+
+// Step 1: Validate email and send reset code
+exports.forgotPassword = async (req, res) => {
+  try {
+    if (handleValidationErrors(req, res)) return;
+
+    const email = String(req.body.email || '').toLowerCase().trim();
+    const user = await User.findOne({ email });
+
+    // Always respond with success to prevent email enumeration
+    if (!user || !user.isVerified) {
+      return res.json({
+        success: true,
+        message: 'If that email exists, a password reset code was sent.',
+      });
+    }
+
+    // Check if user has local PIN auth enabled
+    const hasLocalPin = !!(user.authMethods?.localPin ?? user.pin);
+    if (!hasLocalPin) {
+      // User only uses OAuth, no PIN to reset
+      return res.json({
+        success: true,
+        message: 'If that email exists, a password reset code was sent.',
+      });
+    }
+
+    const otp = generateNumericOtp(6);
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    await PasswordReset.findOneAndUpdate(
+      { email },
+      { email, codeHash: await hashValue(otp), expiresAt, used: false },
+      { upsert: true, new: true }
+    );
+
+    await sendPasswordResetEmail({
+      email,
+      name: user.name,
+      code: otp,
+      expiresInMinutes: 15,
+    });
+
+    return res.json({
+      success: true,
+      message: 'If that email exists, a password reset code was sent.',
+    });
+  } catch (error) {
+    console.error('Forgot password error:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Unable to process password reset request',
+    });
+  }
+};
+
+// Step 2: Verify reset code
+exports.verifyResetCode = async (req, res) => {
+  try {
+    if (handleValidationErrors(req, res)) return;
+
+    const email = String(req.body.email || '').toLowerCase().trim();
+    const code = String(req.body.code || '');
+
+    const user = await User.findOne({ email });
+    if (!user || !user.isVerified) {
+      return res.status(404).json({
+        success: false,
+        message: 'Invalid or expired reset code',
+      });
+    }
+
+    const resetRequest = await PasswordReset.findOne({
+      email,
+      used: false,
+    });
+
+    if (!resetRequest) {
+      return res.status(404).json({
+        success: false,
+        message: 'Invalid or expired reset code',
+      });
+    }
+
+    if (new Date(resetRequest.expiresAt).getTime() <= Date.now()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Reset code has expired. Please request a new one.',
+      });
+    }
+
+    if (!(await compareHashedValue(code, resetRequest.codeHash))) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired reset code',
+      });
+    }
+
+    // Mark code as verified (not used yet, will be used when PIN is actually reset)
+    return res.json({
+      success: true,
+      message: 'Reset code verified. You can now set a new PIN.',
+      verified: true,
+    });
+  } catch (error) {
+    console.error('Verify reset code error:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Unable to verify reset code',
+    });
+  }
+};
+
+// Step 3: Reset PIN with verified code
+exports.resetPassword = async (req, res) => {
+  try {
+    if (handleValidationErrors(req, res)) return;
+
+    const email = String(req.body.email || '').toLowerCase().trim();
+    const code = String(req.body.code || '');
+    const newPin = String(req.body.newPin || '');
+
+    if (!newPin || newPin.length !== 6 || !/^\d{6}$/.test(newPin)) {
+      return res.status(400).json({
+        success: false,
+        message: 'PIN must be exactly 6 digits',
+      });
+    }
+
+    const user = await User.findOne({ email });
+    if (!user || !user.isVerified) {
+      return res.status(404).json({
+        success: false,
+        message: 'Unable to reset password',
+      });
+    }
+
+    const resetRequest = await PasswordReset.findOne({
+      email,
+      used: false,
+    });
+
+    if (!resetRequest) {
+      return res.status(404).json({
+        success: false,
+        message: 'Invalid or expired reset code',
+      });
+    }
+
+    if (new Date(resetRequest.expiresAt).getTime() <= Date.now()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Reset code has expired. Please request a new one.',
+      });
+    }
+
+    if (!(await compareHashedValue(code, resetRequest.codeHash))) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired reset code',
+      });
+    }
+
+    // Update the PIN
+    user.pin = newPin;
+    user.authMethods = {
+      ...(user.authMethods || {}),
+      localPin: true,
+      google: !!(user.authMethods?.google ?? user.providers?.google?.providerId),
+      github: !!(user.authMethods?.github ?? user.providers?.github?.providerId),
+    };
+    await user.save();
+
+    // Mark reset request as used
+    resetRequest.used = true;
+    await resetRequest.save();
+
+    // Optionally, revoke all existing sessions for security
+    await revokeAllSessions(user._id);
+
+    return res.json({
+      success: true,
+      message: 'PIN reset successfully. You can now login with your new PIN.',
+    });
+  } catch (error) {
+    console.error('Reset password error:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Unable to reset password',
+    });
+  }
+};
+
+// Check if email exists (for frontend validation)
+exports.checkEmail = async (req, res) => {
+  try {
+    if (handleValidationErrors(req, res)) return;
+
+    const email = String(req.body.email || '').toLowerCase().trim();
+    const user = await User.findOne({ email });
+
+    return res.json({
+      success: true,
+      exists: !!(user && user.isVerified),
+      hasLocalAuth: !!(user && (user.authMethods?.localPin ?? user.pin)),
+    });
+  } catch (error) {
+    console.error('Check email error:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Unable to check email',
+    });
   }
 };

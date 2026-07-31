@@ -62,6 +62,13 @@ router.post('/login/verify-mfa', loginMfaLimiter, loginMfaValidation, authContro
 router.post('/login/mfa/send-email-otp', loginMfaLimiter, [body('challengeToken').isString().notEmpty()], authController.sendMfaEmailOtp);
 router.post('/login/otp/request', loginLimiter, [body('email').isEmail().normalizeEmail()], authController.requestLoginOtp);
 router.post('/login/otp/verify', loginMfaLimiter, [body('email').isEmail().normalizeEmail(), body('code').isLength({ min: 6, max: 6 }).isNumeric()], authController.verifyLoginOtp);
+
+// Forgot Password Routes
+router.post('/check-email', [body('email').isEmail().normalizeEmail()], authController.checkEmail);
+router.post('/forgot-password', loginLimiter, [body('email').isEmail().normalizeEmail()], authController.forgotPassword);
+router.post('/verify-reset-code', loginMfaLimiter, [body('email').isEmail().normalizeEmail(), body('code').isLength({ min: 6, max: 6 }).isNumeric()], authController.verifyResetCode);
+router.post('/reset-password', loginMfaLimiter, [body('email').isEmail().normalizeEmail(), body('code').isLength({ min: 6, max: 6 }).isNumeric(), body('newPin').isLength({ min: 6, max: 6 }).isNumeric()], authController.resetPassword);
+
 router.get('/google', oauthController.startGoogle);
 router.get('/google/callback', oauthController.googleCallback);
 router.get('/github', oauthController.startGitHub);
