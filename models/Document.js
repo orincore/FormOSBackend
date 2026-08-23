@@ -33,7 +33,7 @@ const documentSchema = new mongoose.Schema({
   },
   ocrStatus: {
     type: String,
-    enum: ['pending', 'processing', 'completed', 'failed'],
+    enum: ['pending', 'processing', 'completed', 'failed', 'skipped'],
     default: 'pending'
   },
   extractedText: {
@@ -45,7 +45,7 @@ const documentSchema = new mongoose.Schema({
   // S3 specific fields
   storageType: {
     type: String,
-    enum: ['local', 's3'],
+    enum: ['local', 's3', 'gridfs'],
     default: 'local'
   },
   s3Key: {
@@ -53,6 +53,27 @@ const documentSchema = new mongoose.Schema({
   },
   s3Location: {
     type: String
+  },
+  securityVersion: {
+    type: Number,
+    enum: [1, 2],
+    default: 1,
+  },
+  encryptionVersion: {
+    type: Number,
+    default: 0,
+  },
+  gridfsId: {
+    type: mongoose.Schema.Types.ObjectId,
+    default: null,
+  },
+  encryptedText: {
+    type: String,
+    default: null,
+  },
+  encryptedStructuredData: {
+    type: String,
+    default: null,
   },
   uploadedAt: {
     type: Date,

@@ -18,6 +18,15 @@ exports.checkEligibility = async (req, res) => {
     if (!user) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
+    if (user.securityVersion === 2) {
+      return res.status(403).json({
+        success: false,
+        code: 'AI_POLICY_VIOLATION',
+        message: "Blocked: Operation 'ELIGIBILITY' is classified as LOCAL_ONLY/SENSITIVE and is blocked under Security V2.",
+        operation: 'ELIGIBILITY',
+        securityVersion: 2
+      });
+    }
 
     const context = ragService.prepareContext(user);
 
@@ -50,7 +59,10 @@ ${jd}
 
 JSON:`;
 
-    const aiResponse = await aiService.chat(systemPrompt, userPrompt);
+    const aiResponse = await aiService.chat(systemPrompt, userPrompt, {
+      user,
+      operation: aiService.AI_OPERATION.ELIGIBILITY
+    });
 
     if (!aiResponse) {
       return res.status(500).json({ success: false, message: 'AI service returned no response.' });
@@ -100,6 +112,15 @@ JSON:`;
 
   } catch (error) {
     console.error('Eligibility check error:', error);
+    if (error.name === 'AIPolicyViolationError') {
+      return res.status(403).json({
+        success: false,
+        code: error.code,
+        message: error.message,
+        operation: error.operation,
+        securityVersion: error.securityVersion
+      });
+    }
     res.status(500).json({ success: false, message: 'Error checking eligibility' });
   }
 };

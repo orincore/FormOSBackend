@@ -54,42 +54,56 @@ const getEffectiveAuthMethods = (user) => ({
   github: !!(user.authMethods?.github ?? user.providers?.github?.providerId),
 });
 
-const buildMaskedUser = (user, session = null) => ({
-  id: user._id,
-  email: user.email,
-  name: user.name,
-  phone: user.phone || '',
-  isVerified: !!user.isVerified,
-  extractedData: maskStructuredData(user.extractedData || {}),
-  security: {
-    mfaEnabled: !!user.security?.mfa?.enabled,
-    mfaRequired: true,
-    recoveryCodesRemaining: user.security?.mfa?.backupCodeHashes?.length || 0,
-  },
-  authMethods: getEffectiveAuthMethods(user),
-  providers: {
-    google: {
-      linked: !!user.providers?.google?.providerId,
-      email: user.providers?.google?.email || '',
-      linkedAt: user.providers?.google?.linkedAt || null,
+const buildMaskedUser = (user, session = null) => {
+  const isV2 = user.securityVersion === 2;
+  return {
+    id: user._id,
+    email: user.email,
+    name: user.name,
+    phone: user.phone || '',
+    isVerified: !!user.isVerified,
+    extractedData: isV2 ? {} : maskStructuredData(user.extractedData || {}),
+    security: {
+      mfaEnabled: !!user.security?.mfa?.enabled,
+      mfaRequired: true,
+      recoveryCodesRemaining: user.security?.mfa?.backupCodeHashes?.length || 0,
     },
-    github: {
-      linked: !!user.providers?.github?.providerId,
-      email: user.providers?.github?.email || '',
-      username: user.providers?.github?.username || '',
-      linkedAt: user.providers?.github?.linkedAt || null,
+    authMethods: getEffectiveAuthMethods(user),
+    providers: {
+      google: {
+        linked: !!user.providers?.google?.providerId,
+        email: user.providers?.google?.email || '',
+        linkedAt: user.providers?.google?.linkedAt || null,
+      },
+      github: {
+        linked: !!user.providers?.github?.providerId,
+        email: user.providers?.github?.email || '',
+        username: user.providers?.github?.username || '',
+        linkedAt: user.providers?.github?.linkedAt || null,
+      },
     },
-  },
-  stepUp: {
-    verified: !!(session?.stepUpExpiresAt && new Date(session.stepUpExpiresAt).getTime() > Date.now()),
-    expiresAt: session?.stepUpExpiresAt || null,
-  },
-});
+    stepUp: {
+      verified: !!(session?.stepUpExpiresAt && new Date(session.stepUpExpiresAt).getTime() > Date.now()),
+      expiresAt: session?.stepUpExpiresAt || null,
+    },
+    ...(isV2 ? {
+      encryptedProfile: user.encryptedProfile || null,
+      userSalt: user.userSalt || null,
+      wrappedUserKey: user.wrappedUserKey || null,
+      securityVersion: 2,
+    } : {
+      securityVersion: 1,
+    }),
+  };
+};
 
-const buildFullUser = (user, session = null) => ({
-  ...buildMaskedUser(user, session),
-  extractedData: user.extractedData || {},
-});
+const buildFullUser = (user, session = null) => {
+  const isV2 = user.securityVersion === 2;
+  return {
+    ...buildMaskedUser(user, session),
+    extractedData: isV2 ? {} : (user.extractedData || {}),
+  };
+};
 
 const buildAuthResponse = (user, session) => ({
   success: true,
@@ -162,7 +176,7 @@ exports.startSignup = async (req, res) => {
     if (handleValidationErrors(req, res)) return;
 
     const email = String(req.body.email || '').toLowerCase().trim();
-    const { name, pin, phone } = req.body;
+    const { name, pin, phone, securityVersion, userSalt, recoverySalt, wrappedUserKey, wrappedUserKeyRecovery } = req.body;
 
     const existingUser = await User.findOne({ email });
     if (existingUser) {
@@ -180,6 +194,11 @@ exports.startSignup = async (req, res) => {
         name,
         phone: phone || '',
         authMode: 'local',
+        securityVersion: securityVersion || 1,
+        userSalt: userSalt || null,
+        recoverySalt: recoverySalt || null,
+        wrappedUserKey: wrappedUserKey || null,
+        wrappedUserKeyRecovery: wrappedUserKeyRecovery || null,
         ...(() => {
           const encryptedPin = encryptText(pin);
           return {
@@ -499,6 +518,12 @@ exports.completeSignup = async (req, res) => {
     if (pending.authMode === 'local') {
       userPayload.pin = decryptedPin;
     }
+
+    userPayload.securityVersion = pending.securityVersion || 1;
+    userPayload.userSalt = pending.userSalt || null;
+    userPayload.recoverySalt = pending.recoverySalt || null;
+    userPayload.wrappedUserKey = pending.wrappedUserKey || null;
+    userPayload.wrappedUserKeyRecovery = pending.wrappedUserKeyRecovery || null;
 
     const user = await User.create(userPayload);
 
@@ -1156,6 +1181,8 @@ exports.verifyResetCode = async (req, res) => {
       success: true,
       message: 'Reset code verified. You can now set a new PIN.',
       verified: true,
+      wrappedUserKeyRecovery: user.wrappedUserKeyRecovery || null,
+      recoverySalt: user.recoverySalt || null,
     });
   } catch (error) {
     console.error('Verify reset code error:', error.message);
@@ -1224,6 +1251,9 @@ exports.resetPassword = async (req, res) => {
       google: !!(user.authMethods?.google ?? user.providers?.google?.providerId),
       github: !!(user.authMethods?.github ?? user.providers?.github?.providerId),
     };
+    if (req.body.wrappedUserKey) {
+      user.wrappedUserKey = req.body.wrappedUserKey;
+    }
     await user.save();
 
     // Mark reset request as used
@@ -1258,6 +1288,8 @@ exports.checkEmail = async (req, res) => {
       success: true,
       exists: !!(user && user.isVerified),
       hasLocalAuth: !!(user && (user.authMethods?.localPin ?? user.pin)),
+      userSalt: user ? user.userSalt || null : null,
+      securityVersion: user ? user.securityVersion || 1 : 1
     });
   } catch (error) {
     console.error('Check email error:', error.message);
@@ -1265,5 +1297,23 @@ exports.checkEmail = async (req, res) => {
       success: false,
       message: 'Unable to check email',
     });
+  }
+};
+
+exports.getKeys = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    return res.json({
+      success: true,
+      wrappedUserKey: user.wrappedUserKey || null,
+      wrappedUserKeyRecovery: user.wrappedUserKeyRecovery || null,
+      recoverySalt: user.recoverySalt || null,
+    });
+  } catch (error) {
+    console.error('Get keys error:', error.message);
+    return res.status(500).json({ success: false, message: 'Unable to retrieve key metadata' });
   }
 };

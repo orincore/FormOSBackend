@@ -43,6 +43,12 @@ const authMiddleware = async (req, res, next) => {
     }
 
     if (!user.isVerified || !user.emailVerifiedAt || !user.security?.mfa?.enabled) {
+      console.log('DEBUG AUTH 403:', {
+        email: user.email,
+        isVerified: user.isVerified,
+        emailVerifiedAt: user.emailVerifiedAt,
+        mfaEnabled: user.security?.mfa?.enabled
+      });
       return res.status(403).json({
         success: false,
         message: 'Account verification is incomplete'

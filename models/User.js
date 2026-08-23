@@ -99,6 +99,36 @@ const userSchema = new mongoose.Schema({
       profileUrl: String
     }
   },
+  securityVersion: {
+    type: Number,
+    enum: [1, 2],
+    default: 1,
+  },
+  migrationStatus: {
+    type: String,
+    enum: ['pending', 'in_progress', 'partial', 'completed', 'failed'],
+    default: 'pending',
+  },
+  encryptedProfile: {
+    type: String,
+    default: null,
+  },
+  userSalt: {
+    type: String,
+    default: null,
+  },
+  recoverySalt: {
+    type: String,
+    default: null,
+  },
+  wrappedUserKey: {
+    type: String,
+    default: null,
+  },
+  wrappedUserKeyRecovery: {
+    type: String,
+    default: null,
+  },
   createdAt: {
     type: Date,
     default: Date.now

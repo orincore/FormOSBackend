@@ -91,6 +91,27 @@ const pendingRegistrationSchema = new mongoose.Schema(
       avatarUrl: String,
       profileUrl: String,
     },
+    securityVersion: {
+      type: Number,
+      enum: [1, 2],
+      default: 1
+    },
+    userSalt: {
+      type: String,
+      default: null,
+    },
+    recoverySalt: {
+      type: String,
+      default: null,
+    },
+    wrappedUserKey: {
+      type: String,
+      default: null,
+    },
+    wrappedUserKeyRecovery: {
+      type: String,
+      default: null,
+    },
     expiresAt: {
       type: Date,
       required: true,

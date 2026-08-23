@@ -33,6 +33,15 @@ exports.chat = async (req, res) => {
     res.json({ success: true, response });
   } catch (error) {
     console.error('Chat error:', error);
+    if (error.name === 'AIPolicyViolationError') {
+      return res.status(403).json({
+        success: false,
+        code: error.code,
+        message: error.message,
+        operation: error.operation,
+        securityVersion: error.securityVersion
+      });
+    }
     if (error.message === 'AI service is not configured') {
       return res.status(503).json({
         success: false,

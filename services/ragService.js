@@ -3,6 +3,14 @@ const aiService = require('./aiService');
 class RAGService {
   async queryUserData(userQuestion, userData) {
     try {
+      if (userData && userData.securityVersion === 2) {
+        throw new aiService.AIPolicyViolationError(
+          "Blocked: Operation 'RAG' is classified as LOCAL_ONLY/SENSITIVE and is blocked under Security V2.",
+          'RAG',
+          2
+        );
+      }
+
       // Return a user-friendly message instead of crashing when AI is not configured.
       if (!aiService.isConfigured()) {
         return 'AI service is not configured. Please add GEMINI_API_KEY, OPENAI_API_KEY, or OPENROUTER_API_KEY to your .env file.';
@@ -32,9 +40,15 @@ INSTRUCTIONS:
 
 ANSWER:`;
 
-      return await aiService.chat(systemPrompt, userPrompt);
+      return await aiService.chat(systemPrompt, userPrompt, {
+        user: userData,
+        operation: aiService.AI_OPERATION.RAG
+      });
     } catch (error) {
       console.error('RAG query error:', error);
+      if (error.name === 'AIPolicyViolationError') {
+        throw error;
+      }
       throw new Error('Failed to process AI query');
     }
   }

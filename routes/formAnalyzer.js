@@ -42,5 +42,6 @@ router.post('/analyze', auth, upload.single('form'), formAnalyzerController.anal
 router.get('/user-data', auth, formAnalyzerController.getUserData);
 router.post('/prepare-autofill', auth, formAnalyzerController.prepareAutofill);
 router.post('/update-field', auth, formAnalyzerController.updateField);
+router.post('/map-structure', auth, formAnalyzerController.mapStructure);
 
 module.exports = router;

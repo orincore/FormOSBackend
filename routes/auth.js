@@ -77,6 +77,7 @@ router.post('/oauth/result/consume', [body('flow').isString().notEmpty()], oauth
 router.post('/oauth/link/start', authMiddleware, requireStepUp, [body('provider').isIn(['google', 'github'])], oauthController.startLink);
 router.delete('/providers/:provider', authMiddleware, requireStepUp, oauthController.unlinkProvider);
 
+router.get('/keys', authMiddleware, authController.getKeys);
 router.get('/me', authMiddleware, authController.getProfile);
 router.get('/me/reveal', authMiddleware, requireStepUp, authController.getFullProfile);
 router.put('/profile', authMiddleware, authController.updateProfile);

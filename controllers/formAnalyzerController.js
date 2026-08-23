@@ -324,3 +324,137 @@ exports.updateField = async (req, res) => {
     });
   }
 };
+
+const validateLabels = (labels) => {
+  if (!Array.isArray(labels)) {
+    throw new Error('Labels must be an array of strings');
+  }
+
+  const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/;
+  // Phone numbers: check for 10-12 digits optionally prefixed with +
+  const phoneRegex = /\+?\d{10,12}/;
+  // Aadhaar numbers: 12 digits (often spaced in groups of 4)
+  const aadhaarRegex = /\d{4}\s?\d{4}\s?\d{4}/;
+  // PAN numbers: 5 letters, 4 digits, 1 letter
+  const panRegex = /[A-Z]{5}\d{4}[A-Z]/i;
+  // Passport numbers: 1 letter, 7 digits
+  const passportRegex = /[A-Z]\d{7}/i;
+  // Long identifier tokens: e.g. 15+ alphanumeric chars
+  const longTokenRegex = /[a-zA-Z0-9_-]{15,}/;
+
+  for (const label of labels) {
+    if (typeof label !== 'string') {
+      throw new Error('Each label must be a string');
+    }
+    if (label.length > 50) {
+      throw new Error(`Label exceeds maximum length of 50 characters: "${label.substring(0, 20)}..."`);
+    }
+    if (emailRegex.test(label)) {
+      throw new Error(`Potential sensitive data detected (email) in label: "${label}"`);
+    }
+    if (phoneRegex.test(label)) {
+      throw new Error(`Potential sensitive data detected (phone) in label: "${label}"`);
+    }
+    if (aadhaarRegex.test(label)) {
+      throw new Error(`Potential sensitive data detected (Aadhaar) in label: "${label}"`);
+    }
+    if (panRegex.test(label)) {
+      throw new Error(`Potential sensitive data detected (PAN) in label: "${label}"`);
+    }
+    if (passportRegex.test(label)) {
+      throw new Error(`Potential sensitive data detected (passport ID) in label: "${label}"`);
+    }
+    if (longTokenRegex.test(label)) {
+      throw new Error(`Potential sensitive data detected (long ID token) in label: "${label}"`);
+    }
+  }
+};
+
+exports.mapStructure = async (req, res) => {
+  try {
+    const { labels } = req.body;
+    
+    if (!labels) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing labels array in request body'
+      });
+    }
+
+    // Secondary defense validator
+    try {
+      validateLabels(labels);
+    } catch (valErr) {
+      return res.status(400).json({
+        success: false,
+        message: valErr.message
+      });
+    }
+
+    const aiService = require('../services/aiService');
+    if (!aiService.isConfigured()) {
+      return res.status(503).json({
+        success: false,
+        message: 'AI service is not configured'
+      });
+    }
+
+    const systemPrompt = `You are a schema mapping AI. You map arbitrary document field labels to canonical FormOS profile fields.
+Canonical FormOS fields are:
+- full_name
+- first_name
+- last_name
+- date_of_birth
+- phone
+- email
+- address
+- pan_number
+- passport_number
+- employee_id
+- company
+- degree
+- joining_date
+
+Map each input label to the closest matching canonical field name. If no match is found, map it to null.
+Return the output strictly as a JSON object of key-value pairs where the key is the input label and the value is the mapped canonical field. Do not include any explanations, markdown code blocks, or preamble.`;
+
+    const user = req.user || (req.userId ? await User.findById(req.userId) : null);
+    const userPrompt = JSON.stringify(labels);
+    const aiResponse = await aiService.chat(systemPrompt, userPrompt, {
+      user,
+      operation: aiService.AI_OPERATION.SCHEMA_MAPPING
+    });
+
+    let mappings = {};
+    try {
+      const cleanJson = aiResponse.replace(/```json|```/g, '').trim();
+      mappings = JSON.parse(cleanJson);
+    } catch (parseError) {
+      console.error('Failed to parse AI response:', aiResponse);
+      return res.status(502).json({
+        success: false,
+        message: 'Invalid response format from AI mapping service'
+      });
+    }
+
+    return res.json({
+      success: true,
+      mappings
+    });
+  } catch (error) {
+    console.error('Map structure error:', error);
+    if (error.name === 'AIPolicyViolationError') {
+      return res.status(403).json({
+        success: false,
+        code: error.code,
+        message: error.message,
+        operation: error.operation,
+        securityVersion: error.securityVersion
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      message: 'Error mapping document structure'
+    });
+  }
+};

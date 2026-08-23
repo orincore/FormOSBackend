@@ -13,6 +13,15 @@ exports.getAutofillData = async (req, res) => {
       });
     }
 
+    if (user.securityVersion === 2) {
+      return res.status(403).json({
+        success: false,
+        code: 'V2_AUTHENTICATION_REQUIRED',
+        securityVersion: 2,
+        message: 'Plaintext autofill data retrieval from the backend is restricted under Security V2.'
+      });
+    }
+
     const includeSensitive = String(req.query.includeSensitive || '').toLowerCase() === 'true';
 
     if (includeSensitive && !req.stepUpVerified) {

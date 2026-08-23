@@ -45,6 +45,7 @@ app.use('/api/autofill', require('./routes/autofill'));
 app.use('/api/form-analyzer', require('./routes/formAnalyzer'));
 app.use('/api/eligibility', require('./routes/eligibility'));
 app.use('/api/extension', require('./routes/extension'));
+app.use('/api/migration', require('./routes/migration'));
 
 // Health check
 app.get('/health', (req, res) => {
