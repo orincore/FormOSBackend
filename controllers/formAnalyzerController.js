@@ -142,9 +142,34 @@ exports.getUserData = async (req, res) => {
     }
 
     const Document = require('../models/Document');
-    const docCount = await Document.countDocuments({ userId: req.userId });
+    const documents = await Document.find({ userId: req.userId });
+    const docCount = documents.length;
 
-    const userData = user.extractedData || {};
+    const userData = { ...(user.extractedData || {}) };
+
+    // Aggregate extracted structured data from user's documents
+    for (const doc of documents) {
+      if (doc.structuredData) {
+        if (!userData.aadhaarNumber && doc.structuredData.aadhaarNumber) {
+          userData.aadhaarNumber = doc.structuredData.aadhaarNumber;
+        }
+        if (!userData.panNumber && doc.structuredData.panNumber) {
+          userData.panNumber = doc.structuredData.panNumber;
+        }
+        if (!userData.dateOfBirth && doc.structuredData.dateOfBirth) {
+          userData.dateOfBirth = doc.structuredData.dateOfBirth;
+        }
+        if (!userData.address && doc.structuredData.address) {
+          userData.address = doc.structuredData.address;
+        }
+        if (!userData.phone && doc.structuredData.phone) {
+          userData.phone = doc.structuredData.phone;
+        }
+        if (!userData.fullName && (doc.structuredData.fullName || doc.structuredData.name)) {
+          userData.fullName = doc.structuredData.fullName || doc.structuredData.name;
+        }
+      }
+    }
     
     res.json({
       success: true,
@@ -159,6 +184,8 @@ exports.getUserData = async (req, res) => {
         email: userData.email || user.email || null,
         hasAadhaar: !!userData.aadhaarNumber,
         hasPAN: !!userData.panNumber,
+        aadhaarNumber: userData.aadhaarNumber || null,
+        panNumber: userData.panNumber || null,
         customFields: userData.customFields || {},
         documentsCount: docCount
       }
