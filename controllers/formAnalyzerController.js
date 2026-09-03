@@ -141,19 +141,26 @@ exports.getUserData = async (req, res) => {
       });
     }
 
+    const Document = require('../models/Document');
+    const docCount = await Document.countDocuments({ userId: req.userId });
+
     const userData = user.extractedData || {};
     
     res.json({
       success: true,
+      securityVersion: user.securityVersion || 1,
+      encryptedProfile: user.encryptedProfile || null,
+      userSalt: user.userSalt || null,
       userData: {
-        fullName: userData.fullName || null,
+        fullName: userData.fullName || user.name || null,
         dateOfBirth: userData.dateOfBirth || null,
         address: userData.address || null,
-        phone: userData.phone || null,
-        email: userData.email || null,
+        phone: userData.phone || user.phone || null,
+        email: userData.email || user.email || null,
         hasAadhaar: !!userData.aadhaarNumber,
         hasPAN: !!userData.panNumber,
-        customFields: userData.customFields || {}
+        customFields: userData.customFields || {},
+        documentsCount: docCount
       }
     });
   } catch (error) {
