@@ -23,7 +23,15 @@ exports.analyzeForm = async (req, res) => {
       });
     }
 
-    const userData = user.extractedData || {};
+    let userData = user.extractedData || {};
+    if (req.body.userData) {
+      try {
+        const clientUserData = typeof req.body.userData === 'string' ? JSON.parse(req.body.userData) : req.body.userData;
+        userData = { ...userData, ...clientUserData };
+      } catch (e) {
+        console.warn('Failed to parse client userData:', e);
+      }
+    }
     console.log('User data available:', Object.keys(userData));
     
     let result;

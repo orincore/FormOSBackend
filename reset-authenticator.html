@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>FormOS - Scan New Authenticator</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0F172A;
+      color: #F8FAFC;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      padding: 20px;
+    }
+    .card {
+      background: #1E293B;
+      border: 1px solid #334155;
+      border-radius: 20px;
+      padding: 36px;
+      max-width: 480px;
+      text-align: center;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+    }
+    h1 { font-size: 22px; color: #F8FAFC; margin-bottom: 8px; }
+    p { font-size: 14px; color: #94A3B8; line-height: 1.5; margin-bottom: 24px; }
+    .qr-box {
+      background: white;
+      padding: 16px;
+      border-radius: 16px;
+      display: inline-block;
+      margin-bottom: 24px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+    }
+    .qr-box img { width: 220px; height: 220px; display: block; }
+    .manual-key {
+      background: #0F172A;
+      border: 1px solid #334155;
+      padding: 12px 16px;
+      border-radius: 10px;
+      font-family: monospace;
+      font-size: 15px;
+      color: #38BDF8;
+      letter-spacing: 1.5px;
+      word-break: break-all;
+      margin-bottom: 24px;
+      user-select: all;
+    }
+    .recovery-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #E2E8F0;
+      text-align: left;
+      margin-bottom: 8px;
+    }
+    .recovery-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      background: #0F172A;
+      padding: 12px;
+      border-radius: 10px;
+      font-family: monospace;
+      font-size: 12px;
+      color: #F8FAFC;
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    .badge {
+      background: #10B981;
+      color: white;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      display: inline-block;
+      margin-bottom: 16px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">ACTIVE & READY</div>
+    <h1>FormOS Authenticator Setup</h1>
+    <p>Scan this QR code with <strong>Google Authenticator</strong>, <strong>Microsoft Authenticator</strong>, or <strong>Authy</strong> for account <strong>jhatanya211@gmail.com</strong>.</p>
+    
+    <div class="qr-box">
+      <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAANwAAADcCAYAAAAbWs+BAAAAAklEQVR4AewaftIAAAmsSURBVO3BQa4bSxIEwfAC739lH60TFFC/yZeSBmGGv6SqVpxU1ZqTqlpzUlVrTqpqzUlVrXnlN4D8LdS8A2RSMwGZ1DwFZFIzAbml5qcBmdS8A2RScwPIpGYCMqn5BJC/hZrppKrWnFTVmpOqWnNSVWte+Q/U/DQgt9RMQH6amgnItwGZ1DylZgLyCSCTmgnIpGaDmp8G5MZJVa05qao1J1W15qSq1rzyISBPqfk2NU8BmdRMQCY1G4DcUPNtQJ5SMwF5Ss0ngDyl5qmTqlpzUlVrTqpqzUlVrXnlHwbkhpqngExqPgHkhpoJyA0gN9S8A2RScwPIDTUTkP9nJ1W15qSq1pxU1ZqTqlrzyv8ZNROQSc2kZgIyAfmEmgnIDTUTkA1AvgnIpGYC8v/ipKrWnFTVmpOqWnNSVWte+ZCav52aG0BuqNkAZFIzqZmATGomIJ9QMwG5oWYCMqn5NjV/wklVrTmpqjUnVbXmpKrWvPIfAPkXAZnU3FAzAZnUTEDeUXNDzQRkUvNtaiYgT6mZgExqJiCTmltA/hYnVbXmpKrWnFTVmpOqWoO/5B8F5IaaCcgNNd8GZFIzAXlKzQ0g76j5JiA31Pw/O6mqNSdVteakqtacVNWak6pa88pvAJnUPAVkUjMB+YSap9TcADKp+QSQSc1TQL4NyKRmAvIUkL+JmhtAJjXTSVWtOamqNSdVteakqtbgL7kE5KepuQXkT1AzAbmlZgIyqZmATGpuAJnU3ALylJoJyKRmAjKpeQfIpOabgNxQM51U1ZqTqlpzUlVrTqpqzSsfUvNNQCY176iZgHyTmgnIpOYTam6ouQHkbwJkUnNDzQTkHTVPAflpJ1W15qSq1pxU1ZqTqlrzyhIgN9TcAjKp+SYgk5obQL5NzQRkUvOnqJmATEBuqPkEkEnNDTXfdFJVa06qas1JVa05qao1+EveAPKUmhtA/hQ1N4BMaiYgk5p3gExqJiCTmgnIDTUTkHfUPAXkKTWfAHJDzTcBmdRMJ1W15qSq1pxU1ZqTqlrzyn+g5pvUfALIpOYpIE+pmYDcAnIDyKTmKTXvALmh5qcBuaVmAjIBeUrNUydVteakqtacVNWak6pa88pvqJmATGomIN+k5hNAJjWTmgnIBOSGmneA3FAzAZmATGo+oeYGkEnNBOQpNbeAfJOabzqpqjUnVbXmpKrWnFTVmld+A8ik5oaaCcik5gaQd9R8E5Cn1ExAbqm5oeYGkEnNBOQdNROQp9RMQCYgk5pPqJmAPAVkUnPjpKrWnFTVmpOqWnNSVWvwl3wZkBtqJiC31NwAMqm5AeQpNe8AeUrNBGRSMwGZ1LwD5JvU3ADyCTUTkEnNn3BSVWtOqmrNSVWtOamqNSdVteaVDwG5oWYCMqn5BJCngExqJiCTmltqJiA/Tc0n1ExAJjU3gHwbkBtAJjUTkEnNBGRSM51U1ZqTqlpzUlVrTqpqzSu/AeSnqZmA3FLz04BMam4AuaVmAnJDzQ0gk5p31NxQcwPIBjVPAZnUfNNJVa05qao1J1W15qSq1rzyITU3gExqJjXfpmYCMqm5AeSGmneATEAmNU8BuQHkHTVPAfkmNbeA3FDzFJCnTqpqzUlVrTmpqjUnVbUGf8klIJOabwIyqbkF5JvUTEA+oWYCMql5CsifouanAXlHzQTkhpqngExqppOqWnNSVWtOqmrNSVWteeUHALmhZlLzCTU3gNwA8pSad4BMam4AuaFmAnJLzQTkBpAbam4AmdS8A+SGmgnIpOabTqpqzUlVrTmpqjUnVbXmlSVqbgD5hJobaiYgk5oJyKTmT1HzlJp3gHyTmgnIpGZSMwH5BJBJzU87qao1J1W15qSq1pxU1ZpXfgPIpGYCMql5Ss0ngExqbqiZgExqJiCTmm9TMwGZ1NwA8o6aCchTQG4AmdTcUvNNQCY1T51U1ZqTqlpzUlVrTqpqzSu/oWYCMql5Csi3qZmATGomIN8EZIOaCcgNNe8AmdTcAHJDzQTkE0AmNTeATGq+6aSq1pxU1ZqTqlpzUlVrTqpqzSsfAjKpmYBMam4AeUfNU0BuqJmA3FBzC8ikZgLypwB5Ss0NNROQSc07QG4AmdRMQCY1k5obJ1W15qSq1pxU1ZqTqlrzym8AuaFmAjKpmYD8TdTcUDMBmYBsUHMDyATkHTU3gExqJiA31Exqvk3NDTU3gExqppOqWnNSVWtOqmrNSVWteeU31NwAMqmZgExqbgB5B8jfQs0tIN8EZFIzqZmA3AIyqfkXAbmh5ptOqmrNSVWtOamqNSdVteaV/wDIDSA3gNxQswHIU2o+oWYC8hSQG2puqZmATGp+GpBPqHkKyKTmxklVrTmpqjUnVbXmpKrW4C95A8ik5gaQSc0EZFIzAbml5qcBmdRMQL5NzTcBeUfNBGRSMwG5oeYGkEnNLSA31ExAnlIznVTVmpOqWnNSVWtOqmrNK7+h5gaQSc0NNROQSc07QG4AuaFmAvJtaiYgTwGZ1ExAvg3IpGYCsgHIpOYpNTeA3DipqjUnVbXmpKrWnFTVGvwlHwDyTWomIO+omYBMaiYgN9TcADKpeQfIpGYC8pSaCcik5h0gN9RMQCY1N4BsUDMBmdR800lVrTmpqjUnVbXmpKrW4C95A8hTaiYgG9TcAHJDzQRkUvMJIJOaCcik5k8BMqmZgPyL1HzTSVWtOamqNSdVteakqta88htqvknNtwGZgDyl5puA/E2ATGq+Dcik5ikgk5pPAJnUTEAmNROQSc10UlVrTqpqzUlVrTmpqjUnVbXmld8A8rdQc0vNBOQGkEnNU2puAZmATGomIN8G5JuATGq+Dcik5ik133RSVWtOqmrNSVWtOamqNa/8B2p+GpBbam6omYB8E5BbaiY1N4DcUDMBmYDcUnMDyJ+i5qcBmdTcOKmqNSdVteakqtacVNWaVz4E5Ck1nwDylJqn1GwAckPNnwLkhppvAvKnqJmATGqmk6pac1JVa06qas1JVa155R+m5ikgT6m5AeQTaiYgN4DcUPMOkAnIDTU3gExqJjUTkHfUPAVkUjMBeeqkqtacVNWak6pac1JVa175PwPkhpo/Rc0E5E8A8m1A/kVqJiDfdFJVa06qas1JVa05qao1r3xIzd9OzQRkUnMDyKRmUnNLzVNAJjUTkEnNJ4BMaiYgk5oJyCeA3FDzJ5xU1ZqTqlpzUlVrTqpqzSv/AZC/CZCn1NwAMqm5AeQdNROQSc1PA/KOmhtq/iZqbgCZ1Dyl5sZJVa05qao1J1W15qSq1uAvqaoVJ1W15qSq1pxU1ZqTqlrzP8kqu9s4vP+HAAAAAElFTkSuQmCC" alt="Authenticator QR Code" />
+    </div>
+
+    <div style="font-size: 12px; color: #64748B; margin-bottom: 6px;">Can't scan? Enter this Secret Key manually:</div>
+    <div class="manual-key">GJRTMTKDKYXHIQLEPNFG6RBQENLD443YIEUEWMTIPE6DYRBQIZFA</div>
+
+    <div class="recovery-title">New Backup Recovery Codes:</div>
+    <div class="recovery-grid">
+      <div>47DE52A7</div><div>5B83B0A2</div><div>656B4713</div><div>9DFB25B5</div><div>801644CC</div><div>7C752E96</div><div>5043E805</div><div>F6323A5D</div>
+    </div>
+    <p style="font-size: 12px; color: #64748B; margin: 0;">Keep your recovery codes in a safe place in case you lose access to your authenticator app.</p>
+  </div>
+</body>
+</html>

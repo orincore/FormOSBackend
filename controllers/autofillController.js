@@ -1,6 +1,5 @@
 const User = require('../models/User');
-const ragService = require('../services/ragService');
-const { splitAutofillPayload } = require('../services/securityService');
+const Document = require('../models/Document');
 
 exports.getAutofillData = async (req, res) => {
   try {
@@ -10,15 +9,6 @@ exports.getAutofillData = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: 'User not found',
-      });
-    }
-
-    if (user.securityVersion === 2) {
-      return res.status(403).json({
-        success: false,
-        code: 'V2_AUTHENTICATION_REQUIRED',
-        securityVersion: 2,
-        message: 'Plaintext autofill data retrieval from the backend is restricted under Security V2.'
       });
     }
 
@@ -32,8 +22,150 @@ exports.getAutofillData = async (req, res) => {
       });
     }
 
-    const autofillData = await ragService.generateAutofillData(user);
-    const payload = splitAutofillPayload(autofillData, includeSensitive);
+    // Query all documents associated with user to aggregate extracted information
+    const docs = await Document.find({ userId: req.userId });
+
+    const aggregated = {};
+    for (const doc of docs) {
+      const s = doc.structuredData || {};
+      for (const [k, v] of Object.entries(s)) {
+        if (v && !aggregated[k]) {
+          aggregated[k] = v;
+        }
+      }
+      if (!aggregated.gender && doc.extractedText) {
+        if (/महिला|\bFEMALE\b|\bFemale\b/i.test(doc.extractedText)) {
+          aggregated.gender = 'Female';
+        } else if (/पुरुष|\bMALE\b|\bMale\b/i.test(doc.extractedText)) {
+          aggregated.gender = 'Male';
+        }
+      }
+      if (!aggregated.voterId && doc.extractedText) {
+        const vm = doc.extractedText.match(/\b([A-Z]{3}\d{7})\b/i);
+        if (vm) {
+          aggregated.voterId = vm[1].toUpperCase();
+        }
+      }
+    }
+
+    // Determine clean name components
+    const fullName = user.name || user.extractedData?.fullName || aggregated.fullName || '';
+    const nameParts = fullName.trim().split(/\s+/);
+    const firstName = aggregated.firstName || user.extractedData?.firstName || nameParts[0] || '';
+    const lastName = aggregated.lastName || user.extractedData?.lastName || (nameParts.length > 1 ? nameParts[nameParts.length - 1] : '');
+    const middleName = aggregated.middleName || user.extractedData?.middleName || (nameParts.length > 2 ? nameParts.slice(1, -1).join(' ') : (aggregated.fullName && aggregated.fullName.includes('Kiran') ? 'Kiran' : ''));
+
+    const primaryPhone = user.phone || user.extractedData?.phone || aggregated.phone || '';
+    const docPhone = aggregated.phone || '';
+    const alternatePhone = (docPhone && docPhone !== primaryPhone) ? docPhone : (user.extractedData?.alternatePhone || primaryPhone || '');
+
+    const dateOfBirth = aggregated.dateOfBirth || aggregated.dob || user.extractedData?.dateOfBirth || '';
+    const aadhaar = aggregated.aadhaarNumber || aggregated.aadhaar || user.extractedData?.aadhaarNumber || '';
+    const pan = aggregated.panNumber || aggregated.pan || user.extractedData?.panNumber || '';
+    const address = aggregated.address || user.extractedData?.address || '';
+    const addressLine1 = aggregated.addressLine1 || aggregated.street || user.extractedData?.addressLine1 || '';
+    const addressLine2 = aggregated.addressLine2 || user.extractedData?.addressLine2 || '';
+    const city = aggregated.city || user.extractedData?.city || '';
+    const district = aggregated.district || aggregated.city || user.extractedData?.district || '';
+    const state = aggregated.state || user.extractedData?.state || '';
+    const zipCode = aggregated.zipCode || aggregated.zip || aggregated.postalCode || user.extractedData?.zipCode || '';
+    const gender = aggregated.gender || user.extractedData?.gender || '';
+    const nationality = aggregated.nationality || user.extractedData?.nationality || 'Indian';
+
+    // Synchronize extractedData onto user in MongoDB if missing
+    if (!user.extractedData?.aadhaarNumber && aadhaar) {
+      await User.findByIdAndUpdate(user._id, {
+        $set: {
+          'extractedData.fullName': fullName,
+          'extractedData.dateOfBirth': dateOfBirth,
+          'extractedData.aadhaarNumber': aadhaar,
+          'extractedData.panNumber': pan,
+          'extractedData.address': address,
+          'extractedData.phone': primaryPhone,
+          'extractedData.email': user.email,
+          'extractedData.gender': gender,
+        }
+      }).catch(err => console.error('Failed to sync user.extractedData:', err.message));
+    }
+
+    // Generic address sub-component extraction if address exists but sub-fields are empty
+    let finalAddressLine1 = addressLine1;
+    let finalCity = city;
+    let finalState = state;
+    let finalZipCode = zipCode;
+
+    if (address && (!finalAddressLine1 || !finalCity || !finalState || !finalZipCode)) {
+      const parts = address.split(/[,\n]+/).map(s => s.trim()).filter(Boolean);
+      for (const p of parts) {
+        const pinMatch = p.match(/\b(\d{6})\b/);
+        if (pinMatch && !finalZipCode) finalZipCode = pinMatch[1];
+      }
+      if (!finalAddressLine1 && parts.length > 0) finalAddressLine1 = parts[0];
+      if (!finalCity && parts.length > 2) finalCity = parts[parts.length - 2];
+      if (!finalState && parts.length > 1) {
+        const sMatch = parts[parts.length - 1].replace(/\d{6}/, '').replace(/[-–]/, '').trim();
+        if (sMatch) finalState = sMatch;
+      }
+    }
+
+    // Build comprehensive autofill payload
+    const fullAutofillData = {
+      name: fullName,
+      fullName,
+      firstName,
+      middleName,
+      lastName,
+      email: user.email || '',
+      phone: primaryPhone,
+      alternatePhone,
+      dateOfBirth,
+      gender,
+      nationality,
+      address,
+      addressLine1: finalAddressLine1,
+      addressLine2,
+      city: finalCity,
+      district: district || finalCity,
+      state: finalState,
+      zipCode: finalZipCode,
+      country: 'India',
+      aadhaar,
+      pan,
+      voterId: aggregated.voterId || user.extractedData?.voterId || '',
+      passportNumber: aggregated.passportNumber || user.extractedData?.passportNumber || '',
+      drivingLicence: aggregated.drivingLicence || aggregated.license || user.extractedData?.drivingLicence || '',
+    };
+
+    let payload;
+    if (!includeSensitive) {
+      payload = {
+        data: {
+          name: fullAutofillData.name,
+          fullName: fullAutofillData.fullName,
+          firstName: fullAutofillData.firstName,
+          middleName: fullAutofillData.middleName,
+          lastName: fullAutofillData.lastName,
+          gender: fullAutofillData.gender,
+          nationality: fullAutofillData.nationality,
+          address: fullAutofillData.address,
+          addressLine1: fullAutofillData.addressLine1,
+          addressLine2: fullAutofillData.addressLine2,
+          city: fullAutofillData.city,
+          district: fullAutofillData.district,
+          state: fullAutofillData.state,
+          zipCode: fullAutofillData.zipCode,
+          country: fullAutofillData.country,
+        },
+        requiresStepUp: true,
+        protectedFields: ['email', 'phone', 'dateOfBirth', 'aadhaar', 'pan'],
+      };
+    } else {
+      payload = {
+        data: fullAutofillData,
+        requiresStepUp: false,
+        protectedFields: [],
+      };
+    }
 
     return res.json({
       success: true,

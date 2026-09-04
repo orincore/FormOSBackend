@@ -110,5 +110,8 @@ router.put(
 );
 
 router.post('/mfa/recovery-codes/regenerate', authMiddleware, requireStepUp, authController.regenerateRecoveryCodes);
+router.post('/mfa/totp/setup', authMiddleware, requireStepUp, authController.setupNewTotp);
+router.post('/mfa/totp/confirm', authMiddleware, requireStepUp, [body('totpCode').isLength({ min: 6, max: 8 })], authController.confirmNewTotp);
+router.post('/sync-vault-data', authMiddleware, authController.syncVaultData);
 
 module.exports = router;

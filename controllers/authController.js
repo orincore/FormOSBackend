@@ -1317,3 +1317,120 @@ exports.getKeys = async (req, res) => {
     return res.status(500).json({ success: false, message: 'Unable to retrieve key metadata' });
   }
 };
+
+// In-memory temporary store for pending TOTP setup
+const pendingTotpSetups = new Map();
+
+exports.setupNewTotp = async (req, res) => {
+  try {
+    const user = await User.findById(req.userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const secret = generateMfaSecret(user.email);
+    const qrCodeDataUrl = await buildQrCodeDataUrl(secret.otpauth_url);
+
+    pendingTotpSetups.set(user._id.toString(), {
+      secretBase32: secret.base32,
+      createdAt: Date.now(),
+    });
+
+    setTimeout(() => {
+      pendingTotpSetups.delete(user._id.toString());
+    }, 10 * 60 * 1000);
+
+    return res.json({
+      success: true,
+      secret: secret.base32,
+      qrCodeDataUrl,
+      message: 'Scan the QR code with your authenticator app and enter the 6-digit code to confirm.',
+    });
+  } catch (error) {
+    console.error('Setup new TOTP error:', error);
+    return res.status(500).json({ success: false, message: 'Error setting up new authenticator' });
+  }
+};
+
+exports.confirmNewTotp = async (req, res) => {
+  try {
+    const { totpCode } = req.body;
+    if (!totpCode) {
+      return res.status(400).json({ success: false, message: 'Authenticator code is required' });
+    }
+
+    const pending = pendingTotpSetups.get(req.userId.toString());
+    if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
+      return res.status(400).json({
+        success: false,
+        message: 'Authenticator setup session expired. Please click Setup Authenticator again.',
+      });
+    }
+
+    const isValid = verifyTotpCode(pending.secretBase32, totpCode);
+    if (!isValid) {
+      return res.status(400).json({ success: false, message: 'Invalid 6-digit code. Please try again.' });
+    }
+
+    const user = await User.findById(req.userId);
+    const { encrypted, iv, authTag } = encryptText(pending.secretBase32);
+    const recovery = await createRecoveryCodes();
+
+    user.security = user.security || {};
+    user.security.mfa = {
+      enabled: true,
+      secretEncrypted: encrypted,
+      secretIv: iv,
+      secretAuthTag: authTag,
+      backupCodeHashes: recovery.hashedCodes,
+      enabledAt: new Date(),
+      lastVerifiedAt: new Date(),
+      recoveryCodesGeneratedAt: new Date(),
+    };
+
+    await user.save();
+    pendingTotpSetups.delete(req.userId.toString());
+
+    return res.json({
+      success: true,
+      message: 'Authenticator app updated successfully!',
+      recoveryCodes: recovery.plainCodes,
+    });
+  } catch (error) {
+    console.error('Confirm new TOTP error:', error);
+    return res.status(500).json({ success: false, message: 'Error confirming new authenticator' });
+  }
+};
+
+exports.syncVaultData = async (req, res) => {
+  try {
+    const user = await User.findById(req.userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const { extractedData, phone } = req.body;
+    if (phone && !user.phone) {
+      user.phone = phone;
+    }
+
+    if (extractedData && typeof extractedData === 'object') {
+      user.extractedData = {
+        ...(user.extractedData || {}),
+        ...extractedData
+      };
+    }
+
+    await user.save();
+    return res.json({
+      success: true,
+      message: 'Vault data synchronized successfully',
+      extractedData: user.extractedData
+    });
+  } catch (error) {
+    console.error('syncVaultData error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to sync vault data' });
+  }
+};
+
+
