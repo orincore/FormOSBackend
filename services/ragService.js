@@ -45,10 +45,10 @@ ANSWER:`;
         operation: aiService.AI_OPERATION.RAG
       });
     } catch (error) {
-      console.error('RAG query error:', error);
       if (error.name === 'AIPolicyViolationError') {
         throw error;
       }
+      console.error('RAG query error:', error);
       throw new Error('Failed to process AI query');
     }
   }
