@@ -3,6 +3,7 @@ const { validationResult } = require('express-validator');
 const passport = require('passport');
 const User = require('../models/User');
 const PendingRegistration = require('../models/PendingRegistration');
+const { findUserByEmail, releaseAbandonedAccount } = require('../services/accountService');
 const { isProviderConfigured } = require('../config/passport');
 const {
   buildQrCodeDataUrl,
@@ -40,6 +41,8 @@ const handleValidationErrors = (req, res) => {
   if (!errors.isEmpty()) {
     res.status(400).json({
       success: false,
+      code: 'VALIDATION_FAILED',
+      message: errors.array()[0]?.msg || 'Invalid request',
       errors: errors.array(),
     });
     return true;
@@ -91,6 +94,12 @@ const getProviderFields = (provider, identity) => (
       }
 );
 
+// Set only this provider's sub-document. Rebuilding the whole `providers` object from a
+// spread Mongoose document produced invalid values and broke OAuth for linked users.
+const applyProviderFields = (user, provider, identity) => {
+  user.set(`providers.${provider}`, getProviderFields(provider, identity)[provider]);
+};
+
 const buildAuthMethodsUpdate = (provider, user) => {
   const current = getEffectiveAuthMethods(user);
   return {
@@ -112,9 +121,7 @@ const buildPendingRegistrationFromOAuth = async (identity) => {
       name: identity.name,
       phone: '',
       authMode: 'oauth',
-      pinEncrypted: null,
-      pinIv: null,
-      pinAuthTag: null,
+      pinHash: null,
       emailVerificationCodeHash: placeholderCodeHash,
       emailVerificationExpiresAt: buildRegistrationExpiry(),
       emailVerificationSentAt: new Date(),
@@ -250,10 +257,7 @@ const providerCallback = (strategyName, provider) => (req, res, next) => {
           return finalizeFlowWithError(flow, res, `Your account is already linked to ${provider}.`);
         }
 
-        currentUser.providers = {
-          ...(currentUser.providers || {}),
-          ...getProviderFields(provider, identity),
-        };
+        applyProviderFields(currentUser, provider, identity);
         currentUser.authMethods = buildAuthMethodsUpdate(provider, currentUser);
         await currentUser.save();
 
@@ -266,6 +270,10 @@ const providerCallback = (strategyName, provider) => (req, res, next) => {
       }
 
       if (linkedUser) {
+        if (linkedUser.status === 'suspended') {
+          return finalizeFlowWithError(flow, res, 'This account has been suspended. Contact support for help.');
+        }
+
         if (!ensureOAuthLoginReadyUser(linkedUser)) {
           return finalizeFlowWithError(
             flow,
@@ -274,10 +282,7 @@ const providerCallback = (strategyName, provider) => (req, res, next) => {
           );
         }
 
-        linkedUser.providers = {
-          ...(linkedUser.providers || {}),
-          ...getProviderFields(provider, identity),
-        };
+        applyProviderFields(linkedUser, provider, identity);
         linkedUser.authMethods = buildAuthMethodsUpdate(provider, linkedUser);
         await linkedUser.save();
 
@@ -307,8 +312,8 @@ const providerCallback = (strategyName, provider) => (req, res, next) => {
         );
       }
 
-      const existingUser = await User.findOne({ email: identity.email });
-      if (existingUser) {
+      const existingUser = await findUserByEmail(identity.email);
+      if (!(await releaseAbandonedAccount(existingUser))) {
         return finalizeFlowWithError(
           flow,
           res,
@@ -324,6 +329,7 @@ const providerCallback = (strategyName, provider) => (req, res, next) => {
 
       return res.redirect(buildFrontendRedirect(flow.flowId));
     } catch (callbackError) {
+      console.error(`OAuth ${provider} callback error:`, callbackError.message);
       return finalizeFlowWithError(flow, res, `Unable to complete ${provider} sign-in right now.`);
     }
   })(req, res, next);
@@ -410,10 +416,7 @@ exports.unlinkProvider = async (req, res) => {
     });
   }
 
-  req.user.providers = {
-    ...(req.user.providers || {}),
-    [provider]: {},
-  };
+  req.user.set(`providers.${provider}`, undefined);
   const remainingMethods = getEffectiveAuthMethods(req.user);
   req.user.authMethods = {
     localPin: remainingMethods.localPin,

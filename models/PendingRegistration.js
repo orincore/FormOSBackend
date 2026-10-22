@@ -24,15 +24,8 @@ const pendingRegistrationSchema = new mongoose.Schema(
       enum: ['local', 'oauth'],
       default: 'local',
     },
-    pinEncrypted: {
-      type: String,
-      default: null,
-    },
-    pinIv: {
-      type: String,
-      default: null,
-    },
-    pinAuthTag: {
+    // bcrypt hash of the chosen PIN; the plain PIN is never stored
+    pinHash: {
       type: String,
       default: null,
     },
@@ -59,6 +52,10 @@ const pendingRegistrationSchema = new mongoose.Schema(
         secretAuthTag: String,
         verifiedAt: {
           type: Date,
+          default: null,
+        },
+        lastUsedTotpStep: {
+          type: Number,
           default: null,
         },
       },
@@ -122,7 +119,7 @@ const pendingRegistrationSchema = new mongoose.Schema(
 );
 
 pendingRegistrationSchema.pre('validate', function(next) {
-  if (this.authMode === 'local' && (!this.pinEncrypted || !this.pinIv || !this.pinAuthTag)) {
+  if (this.authMode === 'local' && !this.pinHash) {
     return next(new Error('PIN data is required for local registrations'));
   }
 

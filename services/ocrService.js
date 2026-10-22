@@ -20,6 +20,22 @@ class OCRService {
     }
   }
 
+  // Reads text straight from memory, so a document that must stay encrypted at rest never touches the disk.
+  // Photos are read by OCR; PDFs that contain real text are read directly. A scanned PDF yields no text.
+  async extractTextFromBuffer(buffer, mimeType) {
+    try {
+      if (mimeType === 'application/pdf') {
+        const parsed = await pdfParse(buffer);
+        return (parsed.text || '').trim().length > 30 ? parsed.text : '';
+      }
+      const result = await Tesseract.recognize(buffer, 'eng');
+      return result.data.text || '';
+    } catch (error) {
+      console.error('In-memory OCR error:', error.message);
+      return '';
+    }
+  }
+
   async extractTextFromImage(imagePath) {
     const result = await Tesseract.recognize(imagePath, 'eng', {
       logger: (m) => console.log(m)
@@ -95,83 +111,156 @@ class OCRService {
     }
   }
 
+  // Aadhaar numbers carry a Verhoeff check digit, so a random 12-digit run (a VID, a phone number)
+  // is rejected instead of being saved as the Aadhaar number.
+  isValidAadhaar(digits) {
+    if (!/^[2-9]\d{11}$/.test(digits)) return false;
+    const d = [[0,1,2,3,4,5,6,7,8,9],[1,2,3,4,0,6,7,8,9,5],[2,3,4,0,1,7,8,9,5,6],[3,4,0,1,2,8,9,5,6,7],[4,0,1,2,3,9,5,6,7,8],[5,9,8,7,6,0,4,3,2,1],[6,5,9,8,7,1,0,4,3,2],[7,6,5,9,8,2,1,0,4,3],[8,7,6,5,9,3,2,1,0,4],[9,8,7,6,5,4,3,2,1,0]];
+    const pm = [[0,1,2,3,4,5,6,7,8,9],[1,5,7,6,2,8,3,0,9,4],[5,8,0,3,7,9,6,1,4,2],[8,9,1,6,0,4,3,5,2,7],[9,4,5,3,1,2,6,8,7,0],[4,2,8,6,5,7,3,9,0,1],[2,7,9,3,8,0,6,4,1,5],[7,0,4,6,9,1,3,2,5,8]];
+    let c = 0;
+    digits.split('').reverse().forEach((ch, i) => { c = d[c][pm[i % 8][Number(ch)]]; });
+    return c === 0;
+  }
+
+  detectDocumentType(text) {
+    const t = text.toUpperCase();
+    if (/INCOME TAX DEPARTMENT|PERMANENT ACCOUNT NUMBER/.test(t) || /\b[A-Z]{5}\d{4}[A-Z]\b/.test(t) && !/AADHAAR|UIDAI/.test(t)) return 'pan';
+    if (/AADHAAR|UIDAI|UNIQUE IDENTIFICATION|आधार/.test(t)) return 'aadhaar';
+    if (/REPUBLIC OF INDIA/.test(t) && /PASSPORT/.test(t)) return 'passport';
+    if (/DRIVING LICEN[CS]E|UNION OF INDIA.*LICEN/.test(t)) return 'license';
+    if (/ELECTION COMMISSION|ELECTOR/.test(t)) return 'voter';
+    return 'other';
+  }
+
+  toTitleCase(value) {
+    return value.toLowerCase().replace(/\b[a-z]/g, (c) => c.toUpperCase());
+  }
+
+  // Dates are stored as DD/MM/YYYY whatever the card printed.
+  normalizeDate(raw) {
+    const m = String(raw || '').match(/(\d{1,2})\s*[-\/.]\s*(\d{1,2})\s*[-\/.]\s*(\d{4})/);
+    if (!m) return '';
+    const [, dd, mm, yyyy] = m;
+    if (Number(mm) < 1 || Number(mm) > 12 || Number(dd) < 1 || Number(dd) > 31) return '';
+    return `${dd.padStart(2, '0')}/${mm.padStart(2, '0')}/${yyyy}`;
+  }
+
   parseStructuredData(text) {
     const data = {};
-
-    // If text is empty or error message, return empty data
-    if (!text || text.length < 10 || text.includes('processing failed')) {
+    if (!text || text.length < 10 || /processing failed|Failed to extract|No text could be extracted/i.test(text)) {
       return data;
     }
+    const flat = text.replace(/[ \t]+/g, ' ');
 
-    // Extract Aadhaar number (12 digits)
-    const aadhaarMatch = text.match(/\b\d{4}\s?\d{4}\s?\d{4}\b/);
-    if (aadhaarMatch) {
-      data.aadhaarNumber = aadhaarMatch[0].replace(/\s/g, '');
-    }
+    const type = this.detectDocumentType(flat);
+    if (type !== 'other') data.documentType = type;
 
-    // Extract PAN number (ABCDE1234F format)
-    const panMatch = text.match(/\b[A-Z]{5}\d{4}[A-Z]\b/);
-    if (panMatch) {
-      data.panNumber = panMatch[0];
+    // Aadhaar: 4-4-4 groups, but only a number that passes the check digit counts.
+    for (const m of flat.matchAll(/\b([2-9]\d{3})\s?(\d{4})\s?(\d{4})\b/g)) {
+      const digits = m[1] + m[2] + m[3];
+      if (this.isValidAadhaar(digits)) { data.aadhaarNumber = digits; break; }
     }
 
-    // Extract name (common patterns)
-    const nameMatch = text.match(/(?:Name|NAME)[:\s]+([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)/);
-    if (nameMatch) {
-      data.fullName = nameMatch[1];
-    }
+    const panMatch = flat.match(/\b[A-Z]{5}\d{4}[A-Z]\b/);
+    if (panMatch) data.panNumber = panMatch[0];
 
-    // Extract DOB (various formats)
-    const dobMatch = text.match(/(?:DOB|Date of Birth|Birth)[:\s]+(\d{2}[-\/]\d{2}[-\/]\d{4})/);
-    if (dobMatch) {
-      data.dateOfBirth = dobMatch[1];
-    }
+    const passport = flat.match(/(?:Passport\s*(?:No\.?|Number)[:\s]*)\b([A-PR-WY][1-9]\d{6}[1-9])\b/i);
+    if (passport) data.passportNumber = passport[1].toUpperCase();
 
-    // Extract phone number
-    const phoneMatch = text.match(/(?:Phone|Mobile|Tel)[:\s]+(\+?\d{10,12})/);
-    if (phoneMatch) {
-      data.phone = phoneMatch[1];
-    }
+    const license = flat.match(/\b([A-Z]{2}[-\s]?\d{2}[-\s]?(?:19|20)\d{2}\d{7})\b/);
+    if (license && type === 'license') data.drivingLicenseNumber = license[1].replace(/[\s-]/g, '');
 
-    // Extract email
-    const emailMatch = text.match(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/);
-    if (emailMatch) {
-      data.email = emailMatch[0];
-    }
-
-    // Extract address (enhanced pattern to capture full address including state and PIN)
-    // Try multiple patterns to capture complete address
-    let addressMatch = text.match(/(?:Address|ADDRESS)[:\s]+(.+?)(?=\n\n(?:Aadhaar|PAN|DOB|Date)|$)/s);
-    if (!addressMatch) {
-      // Try alternative pattern for Aadhaar cards
-      addressMatch = text.match(/(?:Address|ADDRESS)[:\s]+(.+?)(?=DIST:|Aadhaar|$)/si);
-    }
-    if (!addressMatch) {
-      // Try to capture address with state and PIN
-      addressMatch = text.match(/(?:Address|ADDRESS)[:\s]+(.+?(?:Maharashtra|Gujarat|Karnataka|Tamil Nadu|Delhi|Rajasthan|Uttar Pradesh|Madhya Pradesh|West Bengal|Punjab|Haryana|Bihar|Odisha|Kerala|Assam|Jharkhand|Chhattisgarh|Goa|Uttarakhand|Himachal Pradesh|Tripura|Meghalaya|Manipur|Nagaland|Arunachal Pradesh|Mizoram|Sikkim|Telangana|Andhra Pradesh|MH|GJ|KA|TN|DL|RJ|UP|MP|WB|PB|HR|BR|OR|KL|AS|JH|CG|GA|UK|HP|TR|ML|MN|NL|AR|MZ|SK|TS|AP)\s*-?\s*\d{5,6})/si);
-    }
-    if (addressMatch) {
-      let address = addressMatch[1].trim();
-      // Clean up: remove Aadhaar numbers, VID, and other non-address text
-      address = address.replace(/\b\d{4}\s?\d{4}\s?\d{4}\b/g, ''); // Remove Aadhaar numbers
-      address = address.replace(/VID\s*:\s*\d+/gi, ''); // Remove VID
-      address = address.replace(/Details\s+as\s+on:/gi, ''); // Remove "Details as on:"
-      address = address.replace(/\s{2,}/g, ' '); // Replace multiple spaces with single space
-      data.address = address.trim();
-    } else {
-      // Last resort: try to find address between common markers
-      const addressLines = text.match(/(?:MUKUMD|House|Flat|Plot|Building|Street|Road|Lane|Village).+?(?:Maharashtra|Gujarat|Karnataka|Tamil Nadu|Delhi|Rajasthan|Uttar Pradesh|Madhya Pradesh|West Bengal|Punjab|Haryana|Bihar|Odisha|Kerala|Assam|Jharkhand|Chhattisgarh|Goa|Uttarakhand|Himachal Pradesh|MH|GJ|KA|TN|DL|RJ|UP|MP|WB|PB|HR|BR|OR|KL|AS|JH|CG|GA|UK|HP|TR|ML|MN|NL|AR|MZ|SK|TS|AP)\s*-?\s*\d{5,6}/si);
-      if (addressLines) {
-        let address = addressLines[0].trim();
-        // Clean up
-        address = address.replace(/\b\d{4}\s?\d{4}\s?\d{4}\b/g, '');
-        address = address.replace(/VID\s*:\s*\d+/gi, '');
-        address = address.replace(/\s{2,}/g, ' ');
-        data.address = address.trim();
+    // Name: a labelled line, in any case. On a PAN card the name is the line after "Name".
+    const lines = flat.split('\n').map((l) => l.trim()).filter(Boolean);
+    const nameLine = (label) => {
+      for (let i = 0; i < lines.length; i++) {
+        const same = lines[i].match(new RegExp(`^${label}\\s*[:\\-]\\s*([A-Za-z][A-Za-z .']{2,60})$`, 'i'));
+        if (same) return same[1].trim();
+        if (new RegExp(`^${label}\\s*$`, 'i').test(lines[i]) && lines[i + 1] && /^[A-Za-z][A-Za-z .']{2,60}$/.test(lines[i + 1])) return lines[i + 1].trim();
       }
+      return '';
+    };
+    const name = nameLine('(?:Full\\s+)?Name');
+    if (name && !/father|mother/i.test(name)) data.fullName = this.toTitleCase(name);
+    if (!data.fullName && type === 'aadhaar') {
+      // On an Aadhaar card the holder's name is printed on the line above the date of birth.
+      const at = lines.findIndex((l) => /^(?:DOB|D\.O\.B|Date\s+of\s+Birth|Year\s+of\s+Birth)/i.test(l));
+      const above = at > 0 ? lines[at - 1] : '';
+      if (/^[A-Za-z][A-Za-z .']{2,50}$/.test(above) && above.trim().split(/\s+/).length <= 5 && !/government|india|authority|aadhaar/i.test(above)) data.fullName = this.toTitleCase(above.trim());
     }
+    const father = nameLine("Father'?s?\\s+Name") || nameLine('S/O|Son of|D/O|Daughter of|W/O');
+    if (father) data.fatherName = this.toTitleCase(father);
+
+    const dob = flat.match(/(?:DOB|D\.O\.B|Date\s+of\s+Birth|Birth\s+Date)\s*[:\-]?\s*(\d{1,2}\s*[-\/.]\s*\d{1,2}\s*[-\/.]\s*\d{4})/i)
+      || (type === 'pan' ? flat.match(/\b(\d{2}\/\d{2}\/\d{4})\b/) : null);
+    if (dob) data.dateOfBirth = this.normalizeDate(dob[1]);
+    else {
+      const yob = flat.match(/Year\s+of\s+Birth\s*[:\-]?\s*(\d{4})/i);
+      if (yob) data.yearOfBirth = yob[1];
+    }
+
+    const gender = flat.match(/\b(Male|Female|Transgender)\b/i) || flat.match(/\/\s*(MALE|FEMALE)\b/i);
+    if (gender) data.gender = this.toTitleCase(gender[1]);
+
+    const phone = flat.match(/(?:Phone|Mobile|Mob|Tel)\.?\s*(?:No\.?)?\s*[:\-]?\s*(\+?91[\s-]?)?([6-9]\d{9})\b/i);
+    if (phone) data.phone = phone[2];
+
+    const email = flat.match(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/);
+    if (email) data.email = email[0];
+
+    const pin = flat.match(/\b([1-9]\d{5})\b(?!\d)/);
+    const clean = (a) => a.replace(/\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b/g, '').replace(/VID\s*:?\s*\d[\d\s]*/gi, '')
+      .replace(/Details\s+as\s+on:?\s*[\d\/-]*/gi, '').replace(/\s{2,}/g, ' ').replace(/^[\s,:-]+|[\s,:-]+$/g, '');
+    const addr = flat.match(/Address\s*[:\-]?\s*([\s\S]+?)(?=\n\s*\n|\bVID\b|\bAadhaar\b|\bDOB\b|\bDate of\b|$)/i);
+    if (addr && clean(addr[1]).length > 8) data.address = clean(addr[1]).replace(/\n/g, ', ');
+    else if (type === 'aadhaar' && pin) {
+      const around = flat.slice(Math.max(0, flat.indexOf(pin[1]) - 160), flat.indexOf(pin[1]) + 6);
+      const start = around.search(/\b(?:S\/O|D\/O|W\/O|C\/O|House|Flat|Plot|H\.?No)\b/i);
+      if (start !== -1 && clean(around.slice(start)).length > 8) data.address = clean(around.slice(start)).replace(/\n/g, ', ');
+    }
+    if (pin && data.address && data.address.includes(pin[1])) data.pincode = pin[1];
 
     return data;
+  }
+
+  // Reads the OCR text with the AI to fill what the patterns could not find and to fix OCR slips.
+  // Numbers that passed their own format check are never replaced by the AI's guess.
+  async extractWithAI(text, patternData, aiService, user) {
+    if (!aiService?.isConfigured?.() || !text || text.length < 20) return patternData;
+    const FIELDS = ['documentType', 'fullName', 'fatherName', 'dateOfBirth', 'gender', 'aadhaarNumber', 'panNumber', 'passportNumber', 'drivingLicenseNumber', 'address', 'pincode', 'state', 'phone', 'email'];
+    const system = `You read OCR text from an Indian identity or personal document and return the fields printed on it.
+Rules: copy only what is in the text. Never guess or invent. Use "" for anything not present. Fix obvious OCR slips (0/O, 1/I) only when the document's own format makes the fix certain.
+documentType is one of: aadhaar, pan, passport, license, voter, marksheet, degree, bank_statement, other.
+dateOfBirth as DD/MM/YYYY. Names in Title Case. Aadhaar as 12 digits, PAN as 10 characters.
+Output ONLY one raw JSON object with exactly these keys: ${FIELDS.join(', ')}.`;
+    try {
+      const reply = await aiService.chat(system, `OCR TEXT:\n${text.slice(0, 6000)}\n\nJSON:`, {
+        user: { ...(user?.toObject ? user.toObject() : user || {}), securityVersion: 1 },
+        operation: aiService.AI_OPERATION.CLASSIFICATION,
+      });
+      const start = reply.indexOf('{');
+      const end = reply.lastIndexOf('}');
+      if (start === -1 || end <= start) return patternData;
+      const ai = JSON.parse(reply.slice(start, end + 1));
+
+      const merged = { ...patternData };
+      for (const key of FIELDS) {
+        let value = typeof ai[key] === 'string' ? ai[key].trim() : '';
+        if (!value) continue;
+        if (key === 'aadhaarNumber') { value = value.replace(/\s/g, ''); if (!this.isValidAadhaar(value) || merged[key]) continue; }
+        else if (key === 'panNumber') { value = value.toUpperCase(); if (!/^[A-Z]{5}\d{4}[A-Z]$/.test(value) || merged[key]) continue; }
+        else if (key === 'dateOfBirth') { value = this.normalizeDate(value); if (!value || merged[key]) continue; }
+        else if (key === 'pincode') { if (!/^[1-9]\d{5}$/.test(value)) continue; }
+        else if (key === 'phone') { value = value.replace(/\D/g, '').slice(-10); if (!/^[6-9]\d{9}$/.test(value)) continue; }
+        else if (key === 'documentType') { value = value.toLowerCase(); }
+        else if (merged[key] && merged[key].length >= value.length) continue; // keep the longer, already-read value
+        merged[key] = value;
+      }
+      return merged;
+    } catch (error) {
+      console.warn('AI field extraction skipped:', error.message);
+      return patternData;
+    }
   }
 }
 

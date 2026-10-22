@@ -17,9 +17,33 @@ const SENSITIVE_FIELDS = new Set([
 
 const HIGH_RISK_AUTOFILL_FIELDS = new Set(['aadhaar', 'pan', 'dateOfBirth', 'phone', 'email']);
 
-const getEncryptionKey = () => {
-  const source = process.env.MFA_ENCRYPTION_KEY || process.env.JWT_SECRET || 'formos-dev-fallback';
-  return crypto.createHash('sha256').update(source).digest();
+const deriveKey = (source) => crypto.createHash('sha256').update(source).digest();
+
+const keyConfigError = () => {
+  const error = new Error('MFA_ENCRYPTION_KEY is not configured');
+  error.code = 'MFA_KEY_NOT_CONFIGURED';
+  error.status = 500;
+  return error;
+};
+
+// MFA_ENCRYPTION_KEY is mandatory and never silently substituted: a fallback key
+// would make every stored authenticator secret unreadable the moment the env
+// changes. MFA_ENCRYPTION_KEY_PREVIOUS (comma separated) lets old secrets keep
+// decrypting while a rotation is in progress.
+const getEncryptionKeys = () => {
+  const current = process.env.MFA_ENCRYPTION_KEY;
+  if (!current) throw keyConfigError();
+
+  const previous = (process.env.MFA_ENCRYPTION_KEY_PREVIOUS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  return [current, ...previous].map(deriveKey);
+};
+
+const assertEncryptionConfigured = () => {
+  getEncryptionKeys();
 };
 
 const encryptText = (plainText) => {
@@ -28,7 +52,7 @@ const encryptText = (plainText) => {
   }
 
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', getEncryptionKey(), iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', getEncryptionKeys()[0], iv);
   const encrypted = Buffer.concat([cipher.update(plainText, 'utf8'), cipher.final()]);
   const authTag = cipher.getAuthTag();
 
@@ -44,34 +68,51 @@ const decryptText = ({ encrypted, iv, authTag }) => {
     return null;
   }
 
-  try {
-    const decipher = crypto.createDecipheriv(
-      'aes-256-gcm',
-      getEncryptionKey(),
-      Buffer.from(iv, 'base64')
-    );
-    decipher.setAuthTag(Buffer.from(authTag, 'base64'));
-
-    const decrypted = Buffer.concat([
-      decipher.update(Buffer.from(encrypted, 'base64')),
-      decipher.final(),
-    ]);
-
-    return decrypted.toString('utf8');
-  } catch (error) {
-    const decryptionError = new Error('Stored MFA secret could not be decrypted');
-    decryptionError.code = 'MFA_SECRET_DECRYPT_FAILED';
-    decryptionError.status = 500;
-    throw decryptionError;
+  for (const key of getEncryptionKeys()) {
+    try {
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64'));
+      decipher.setAuthTag(Buffer.from(authTag, 'base64'));
+      return Buffer.concat([
+        decipher.update(Buffer.from(encrypted, 'base64')),
+        decipher.final(),
+      ]).toString('utf8');
+    } catch (error) {
+      // Wrong key for this record; try the next configured key.
+    }
   }
+
+  const decryptionError = new Error('Stored MFA secret could not be decrypted');
+  decryptionError.code = 'MFA_SECRET_DECRYPT_FAILED';
+  decryptionError.status = 500;
+  throw decryptionError;
+};
+
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const MFA_ISSUER = 'FormOS';
+
+const base32Encode = (buffer) => {
+  let bits = '';
+  for (const byte of buffer) bits += byte.toString(2).padStart(8, '0');
+  let output = '';
+  for (let i = 0; i < bits.length; i += 5) {
+    output += BASE32_ALPHABET[parseInt(bits.slice(i, i + 5).padEnd(5, '0'), 2)];
+  }
+  return output;
+};
+
+// 160-bit secret (32 base32 chars) as recommended by RFC 4226 and expected by
+// authenticator apps; the otpauth URI carries the issuer so apps label it correctly.
+const buildOtpauthUrl = (email, base32) => {
+  const label = `${encodeURIComponent(MFA_ISSUER)}:${encodeURIComponent(email)}`;
+  return (
+    `otpauth://totp/${label}?secret=${base32}&issuer=${encodeURIComponent(MFA_ISSUER)}` +
+    '&algorithm=SHA1&digits=6&period=30'
+  );
 };
 
 const generateMfaSecret = (email) => {
-  return speakeasy.generateSecret({
-    name: `FormOS (${email})`,
-    issuer: 'FormOS',
-    length: 32,
-  });
+  const base32 = base32Encode(crypto.randomBytes(20));
+  return { base32, otpauth_url: buildOtpauthUrl(email, base32) };
 };
 
 const buildQrCodeDataUrl = async (otpauthUrl) => {
@@ -95,14 +136,55 @@ const compareHashedValue = async (value, hashedValue) => {
   return bcrypt.compare(value, hashedValue);
 };
 
-const verifyTotpCode = (secret, token) => {
-  return speakeasy.totp.verify({
+const normalizeTotpCode = (code = '') => String(code).replace(/\D/g, '');
+
+// Verifies a code and reports which 30s time step matched so callers can reject
+// replays (a step at or below lastUsedStep has already been consumed).
+const verifyTotp = (secret, token, lastUsedStep = null) => {
+  const normalized = normalizeTotpCode(token);
+  if (!secret || normalized.length !== 6) return { valid: false, step: null };
+
+  const delta = speakeasy.totp.verifyDelta({
     secret,
     encoding: 'base32',
-    token: normalizeCode(token),
+    token: normalized,
     window: 1,
   });
+  if (!delta) return { valid: false, step: null };
+
+  const step = Math.floor(Date.now() / 30000) + delta.delta;
+  if (lastUsedStep !== null && lastUsedStep !== undefined && step <= lastUsedStep) {
+    return { valid: false, step, replayed: true };
+  }
+  return { valid: true, step };
 };
+
+const ADMIN_PASSWORD_MIN = 12;
+const ADMIN_PASSWORD_MAX = 128;
+
+// Returns a sentence describing the problem, or null when the password is acceptable.
+const validateAdminPassword = (password, email = '') => {
+  const value = String(password || '');
+  if (value.length < ADMIN_PASSWORD_MIN) return `Use at least ${ADMIN_PASSWORD_MIN} characters.`;
+  if (value.length > ADMIN_PASSWORD_MAX) return `Use at most ${ADMIN_PASSWORD_MAX} characters.`;
+  if (/^\d+$/.test(value)) return 'Add letters or symbols. Digits alone are too easy to guess.';
+  if (new Set(value).size < 5) return 'Use a more varied password.';
+  const local = String(email).split('@')[0].toLowerCase();
+  if (local.length >= 4 && value.toLowerCase().includes(local)) return 'The password must not contain your email name.';
+  return null;
+};
+
+const hashAdminPassword = (password) => bcrypt.hash(String(password), 12);
+
+// Always performs one bcrypt comparison, so a missing account or password takes about as long
+// as a wrong one and the response time does not reveal which emails belong to staff.
+const DUMMY_HASH = bcrypt.hashSync('formos-dummy-password-for-timing', 12);
+const compareAdminPassword = async (password, hash) => {
+  const matched = await bcrypt.compare(String(password || ''), hash || DUMMY_HASH);
+  return !!hash && matched;
+};
+
+const verifyTotpCode = (secret, token) => verifyTotp(secret, token).valid;
 
 const createRecoveryCodes = async (count = 8) => {
   const plainCodes = Array.from({ length: count }, () =>
@@ -139,7 +221,11 @@ const getClientIp = (req) => {
 };
 
 const getDeviceContext = (req) => {
-  const deviceIdHeader = req.headers['x-device-id'];
+  // Browser redirects (OAuth) cannot set headers, so a deviceId query param is accepted too.
+  const queryDeviceId = typeof req.query?.deviceId === 'string' && /^[\w-]{8,100}$/.test(req.query.deviceId)
+    ? req.query.deviceId
+    : undefined;
+  const deviceIdHeader = req.headers['x-device-id'] || queryDeviceId;
   const deviceNameHeader = req.headers['x-device-name'];
   const clientTypeHeader = req.headers['x-client-type'];
 
@@ -259,8 +345,14 @@ const buildTrustedUntil = (days = DEFAULT_TRUSTED_DEVICE_DAYS) => {
 module.exports = {
   DEFAULT_STEP_UP_MINUTES,
   DEFAULT_TRUSTED_DEVICE_DAYS,
+  ADMIN_PASSWORD_MIN,
+  assertEncryptionConfigured,
+  compareAdminPassword,
+  hashAdminPassword,
+  validateAdminPassword,
   SENSITIVE_FIELDS,
   HIGH_RISK_AUTOFILL_FIELDS,
+  buildOtpauthUrl,
   buildQrCodeDataUrl,
   buildStepUpExpiry,
   buildTrustedUntil,
@@ -279,6 +371,8 @@ module.exports = {
   maskStructuredData,
   maskValueByField,
   normalizeCode,
+  normalizeTotpCode,
   splitAutofillPayload,
+  verifyTotp,
   verifyTotpCode,
 };

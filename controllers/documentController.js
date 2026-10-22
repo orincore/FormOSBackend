@@ -4,7 +4,7 @@ const os = require('os');
 const Document = require('../models/Document');
 const User = require('../models/User');
 const ocrService = require('../services/ocrService');
-const { isS3Configured, downloadFromS3, deleteFromS3 } = require('../services/s3Service');
+const { isS3Configured, isR2Configured, downloadFromS3, deleteFromS3 } = require('../services/s3Service');
 const { maskSensitiveText, maskStructuredData } = require('../services/securityService');
 const StorageService = require('../services/storageService');
 const { flags } = require('../config/featureFlags');
@@ -30,6 +30,35 @@ const serializeDocument = (document, { reveal = false } = {}) => ({
     securityVersion: 1
   })
 });
+
+// Stores one plain (Security V1) document and starts reading it. Used by the app upload and by the
+// WhatsApp assistant, so a file sent in either place goes through exactly the same steps.
+async function savePlainDocument({ userId, buffer, originalName, mimeType, documentType }) {
+  const uploadResult = await StorageService.uploadFile(buffer, originalName, mimeType, userId, false);
+
+  const document = await Document.create({
+    userId,
+    filename: uploadResult.filename || uploadResult.s3Key,
+    originalName,
+    filePath: uploadResult.filePath,
+    fileSize: uploadResult.fileSize,
+    mimeType,
+    documentType: documentType || 'other',
+    ocrStatus: 'pending',
+    storageType: uploadResult.storageType,
+    s3Key: uploadResult.s3Key || null,
+    s3Location: uploadResult.s3Location || null,
+    securityVersion: 1,
+    encryptionVersion: 0
+  });
+
+  // Fetch the file from wherever this file was actually stored.
+  processOCR(document._id, uploadResult.filePath, userId, uploadResult.storageType === 's3');
+  return document;
+}
+
+exports.savePlainDocument = savePlainDocument;
+exports.PLAIN_UPLOAD_TYPES = ['image/jpeg', 'image/png', 'application/pdf'];
 
 exports.uploadDocument = async (req, res) => {
   try {
@@ -72,7 +101,7 @@ exports.uploadDocument = async (req, res) => {
       }
     }
 
-    const useGridFS = flags.GRIDFS_ENABLED && user.securityVersion === 2 && isV2Envelope;
+    const useGridFS = (flags.GRIDFS_ENABLED || isR2Configured()) && user.securityVersion === 2 && isV2Envelope;
 
     // Guard rails:
     // 1. If V1 user tries to upload a V2 envelope -> reject
@@ -83,7 +112,7 @@ exports.uploadDocument = async (req, res) => {
       });
     }
     // 2. If V2 envelope is submitted but GRIDFS_ENABLED is false -> reject
-    if (isV2Envelope && !flags.GRIDFS_ENABLED) {
+    if (isV2Envelope && !flags.GRIDFS_ENABLED && !isR2Configured()) {
       return res.status(403).json({
         success: false,
         message: 'Secure GridFS storage is currently disabled.'
@@ -91,20 +120,21 @@ exports.uploadDocument = async (req, res) => {
     }
 
     if (useGridFS) {
-      // Opaque GridFS V2 upload path
-      const gridfsId = await StorageService.uploadToGridFS(fileBuffer, 'encrypted_blob', header.mimeType);
+      // Opaque encrypted upload path (R2 when configured, otherwise GridFS)
+      const stored = await StorageService.uploadEncrypted(fileBuffer, header.mimeType, req.userId);
 
       const document = new Document({
         userId: req.userId,
         filename: 'Encrypted File', // Mask original filename
         originalName: 'encrypted_file', // Mask original filename
-        filePath: gridfsId.toString(),
+        filePath: stored.filePath,
         fileSize: fileBuffer.length,
         mimeType: header.mimeType,
         documentType: documentType || 'other',
         ocrStatus: 'skipped', // Skip server-side OCR
-        storageType: 'gridfs',
-        gridfsId: gridfsId,
+        storageType: stored.storageType,
+        gridfsId: stored.gridfsId,
+        s3Key: stored.s3Key,
         securityVersion: 2,
         encryptionVersion: 1
       });
@@ -112,9 +142,8 @@ exports.uploadDocument = async (req, res) => {
       try {
         await document.save();
       } catch (dbErr) {
-        console.log('⚠️ MongoDB save failed, initiating GridFS cleanup for ID:', gridfsId);
-        // Cleanup transaction: Delete GridFS file if MongoDB record fails
-        await StorageService.deleteFromGridFS(gridfsId).catch(console.error);
+        console.log('MongoDB save failed, removing the stored encrypted file');
+        await StorageService.discardEncrypted(stored).catch(console.error);
         throw dbErr;
       }
 
@@ -135,32 +164,13 @@ exports.uploadDocument = async (req, res) => {
       });
     }
 
-    const uploadResult = await StorageService.uploadFile(
-      fileBuffer,
-      req.file.originalname,
-      req.file.mimetype,
-      req.userId,
-      false
-    );
-
-    const document = await Document.create({
+    const document = await savePlainDocument({
       userId: req.userId,
-      filename: uploadResult.filename || uploadResult.s3Key,
+      buffer: fileBuffer,
       originalName: req.file.originalname,
-      filePath: uploadResult.filePath,
-      fileSize: uploadResult.fileSize,
       mimeType: req.file.mimetype,
-      documentType: documentType || 'other',
-      ocrStatus: 'pending',
-      storageType: uploadResult.storageType,
-      s3Key: uploadResult.s3Key || null,
-      s3Location: uploadResult.s3Location || null,
-      securityVersion: 1,
-      encryptionVersion: 0
+      documentType,
     });
-
-    const useS3 = isS3Configured();
-    processOCR(document._id, uploadResult.filePath, req.userId, useS3);
 
     return res.status(201).json({
       success: true,
@@ -239,21 +249,22 @@ exports.uploadSecureV2Document = async (req, res) => {
       });
     }
 
-    // Upload to GridFS
-    const gridfsId = await StorageService.uploadToGridFS(fileBuffer, 'encrypted_blob', header.mimeType);
+    // Store the ciphertext (R2 when configured, otherwise GridFS)
+    const stored = await StorageService.uploadEncrypted(fileBuffer, header.mimeType, req.userId);
 
     // Save V2 Document record
     const document = new Document({
       userId: req.userId,
       filename: 'Encrypted File',
       originalName: 'encrypted_file',
-      filePath: gridfsId.toString(),
+      filePath: stored.filePath,
       fileSize: fileBuffer.length,
       mimeType: header.mimeType,
       documentType: req.body.documentType || 'other',
       ocrStatus: 'skipped', // Skip server-side OCR
-      storageType: 'gridfs',
-      gridfsId: gridfsId,
+      storageType: stored.storageType,
+      gridfsId: stored.gridfsId,
+      s3Key: stored.s3Key,
       securityVersion: 2,
       encryptionVersion: 1
     });
@@ -261,8 +272,8 @@ exports.uploadSecureV2Document = async (req, res) => {
     try {
       await document.save();
     } catch (dbErr) {
-      console.error('⚠️ MongoDB save failed, initiating GridFS cleanup for ID:', gridfsId);
-      await StorageService.deleteFromGridFS(gridfsId).catch(console.error);
+      console.error('MongoDB save failed, removing the stored encrypted file');
+      await StorageService.discardEncrypted(stored).catch(console.error);
       throw dbErr;
     }
 
@@ -295,7 +306,8 @@ async function processOCR(documentId, filePathOrKey, userId, useS3 = false) {
     }
 
     const extractedText = await ocrService.extractText(filePath);
-    const structuredData = ocrService.parseStructuredData(extractedText);
+    const owner = await User.findById(userId);
+    const structuredData = await ocrService.extractWithAI(extractedText, ocrService.parseStructuredData(extractedText), require('../services/aiService'), owner);
 
     if (structuredData.address) {
       const formAnalyzerService = require('../services/formAnalyzerService');
@@ -306,13 +318,15 @@ async function processOCR(documentId, filePathOrKey, userId, useS3 = false) {
     await Document.findByIdAndUpdate(documentId, {
       extractedText,
       structuredData,
+      ...(['aadhaar', 'pan', 'passport', 'license'].includes(structuredData.documentType) ? { documentType: structuredData.documentType } : {}),
       ocrStatus: 'completed',
     });
 
     const user = await User.findById(userId);
+    const { documentType: _kind, ...profileFields } = structuredData;
     user.extractedData = {
       ...(user.extractedData || {}),
-      ...structuredData,
+      ...profileFields,
     };
     await user.save();
 
@@ -414,7 +428,7 @@ exports.downloadDocument = async (req, res) => {
       });
     }
 
-    if (document.storageType === 'gridfs') {
+    if (document.storageType === 'gridfs' || document.storageType === 'r2') {
       const fileBuffer = await StorageService.downloadFile(document);
       res.setHeader('Content-Type', 'application/octet-stream');
       res.setHeader('Content-Disposition', 'attachment; filename="encrypted_document"');
@@ -439,9 +453,22 @@ exports.downloadDocument = async (req, res) => {
 
 exports.updateStructuredData = async (req, res) => {
   try {
-    const { structuredData, encryptedText, encryptedStructuredData } = req.body;
+    const { encryptedText, encryptedStructuredData } = req.body;
     const user = await User.findById(req.userId);
     const isV2 = user && user.securityVersion === 2;
+
+    // Corrections are flat text fields only: anything else is dropped, so a bad request cannot store objects.
+    let structuredData = req.body.structuredData;
+    if (structuredData !== undefined) {
+      if (!structuredData || typeof structuredData !== 'object' || Array.isArray(structuredData)) {
+        return res.status(400).json({ success: false, message: 'structuredData must be an object' });
+      }
+      structuredData = Object.fromEntries(
+        Object.entries(structuredData)
+          .filter(([key, value]) => /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(key) && ['string', 'number'].includes(typeof value))
+          .map(([key, value]) => [key, String(value).trim().slice(0, 500)])
+      );
+    }
 
     const updateFields = {};
     if (isV2) {
@@ -503,9 +530,9 @@ exports.deleteDocument = async (req, res) => {
     }
 
     // Delete from S3, GridFS, or local filesystem
-    if (document.storageType === 'gridfs') {
+    if (document.storageType === 'gridfs' || document.storageType === 'r2') {
       await StorageService.deleteFile(document).catch((err) =>
-        console.error('GridFS delete error (non-fatal):', err.message)
+        console.error('Encrypted file delete error (non-fatal):', err.message)
       );
     } else if (document.storageType === 's3' && document.s3Key) {
       await deleteFromS3(document.s3Key).catch((err) =>

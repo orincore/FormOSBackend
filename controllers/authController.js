@@ -4,9 +4,13 @@ const AuthSession = require('../models/AuthSession');
 const PendingRegistration = require('../models/PendingRegistration');
 const LoginOtpChallenge = require('../models/LoginOtpChallenge');
 const PasswordReset = require('../models/PasswordReset');
+const AdminAuditLog = require('../models/AdminAuditLog');
+const { canonicalEmail, emailCandidates, findUserByEmail, releaseAbandonedAccount } = require('../services/accountService');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/emailService');
 const {
+  buildOtpauthUrl,
   buildQrCodeDataUrl,
+  compareAdminPassword,
   compareHashedValue,
   consumeRecoveryCode,
   createRecoveryCodes,
@@ -14,11 +18,13 @@ const {
   encryptText,
   generateMfaSecret,
   generateNumericOtp,
+  getClientIp,
   getDeviceContext,
+  hashIpAddress,
   hashValue,
   maskStructuredData,
   maskValueByField,
-  verifyTotpCode,
+  verifyTotp,
 } = require('../services/securityService');
 const {
   createAccessToken,
@@ -37,8 +43,13 @@ const REGISTRATION_TTL_MINUTES = parseInt(process.env.PENDING_REGISTRATION_TTL_M
 const handleValidationErrors = (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
+    const first = errors.array()[0];
     res.status(400).json({
       success: false,
+      code: 'VALIDATION_FAILED',
+      message: first?.msg && first.msg !== 'Invalid value'
+        ? first.msg
+        : `Please check the ${first?.path || 'submitted'} field and try again.`,
       errors: errors.array(),
     });
     return true;
@@ -62,11 +73,14 @@ const buildMaskedUser = (user, session = null) => {
     name: user.name,
     phone: user.phone || '',
     isVerified: !!user.isVerified,
+    role: user.role || 'user',
+    status: user.status || 'active',
     extractedData: isV2 ? {} : maskStructuredData(user.extractedData || {}),
     security: {
       mfaEnabled: !!user.security?.mfa?.enabled,
       mfaRequired: true,
       recoveryCodesRemaining: user.security?.mfa?.backupCodeHashes?.length || 0,
+      mfaResetRequired: !!user.security?.mfa?.resetRequired,
     },
     authMethods: getEffectiveAuthMethods(user),
     providers: {
@@ -112,6 +126,9 @@ const buildAuthResponse = (user, session) => ({
   session: formatSessionForClient(session, session.sessionId),
 });
 
+exports.buildAuthResponse = (...args) => buildAuthResponse(...args);
+exports.buildMaskedUser = (...args) => buildMaskedUser(...args);
+
 const getPendingRegistration = async (registrationId) => {
   if (!registrationId) return null;
   const pending = await PendingRegistration.findById(registrationId);
@@ -141,49 +158,137 @@ const buildStoredTotpSecret = (mfaState = {}) => decryptText({
   authTag: mfaState.secretAuthTag,
 });
 
+const SUSPENDED_RESPONSE = {
+  success: false,
+  code: 'ACCOUNT_SUSPENDED',
+  message: 'This account has been suspended. Contact support for help.',
+};
+
+const MFA_FAILURES = {
+  RESET_REQUIRED: {
+    status: 403,
+    code: 'MFA_RESET_REQUIRED',
+    message: 'Your authenticator was reset by an administrator. Sign in with an email code, then set up a new authenticator.',
+  },
+  SECRET_UNREADABLE: {
+    status: 409,
+    code: 'MFA_SECRET_UNREADABLE',
+    message: 'Your authenticator secret can no longer be read. Sign in with a recovery code, then set up your authenticator again.',
+  },
+  CODE_REUSED: {
+    status: 401,
+    code: 'MFA_CODE_REUSED',
+    message: 'That code was already used. Wait for your app to show the next code and try again.',
+  },
+  INVALID: {
+    status: 401,
+    code: 'MFA_INVALID_CODE',
+    message: 'Invalid MFA code',
+  },
+};
+
+const mfaFailure = (reason) => MFA_FAILURES[reason] || MFA_FAILURES.INVALID;
+
+// Verifies a TOTP or recovery code. Every accepted credential is consumed with an
+// atomic conditional update so two concurrent requests cannot both succeed with it.
 const verifyMfaAttempt = async (user, { totpCode, recoveryCode }) => {
   if (!ensureActiveVerifiedMfaUser(user)) {
-    return { verified: false };
+    return { verified: false, reason: 'INVALID' };
   }
 
-  const secret = buildStoredTotpSecret(user.security?.mfa);
-
-  if (totpCode && secret && verifyTotpCode(secret, totpCode)) {
-    user.security.mfa.lastVerifiedAt = new Date();
-    await user.save();
-    return { verified: true, method: 'totp' };
+  const mfa = user.security.mfa;
+  if (mfa.resetRequired) {
+    return { verified: false, reason: 'RESET_REQUIRED' };
   }
+  let reason = 'INVALID';
 
-  if (recoveryCode) {
-    const { matched, remainingHashes } = await consumeRecoveryCode(
-      recoveryCode,
-      user.security.mfa.backupCodeHashes || []
-    );
+  if (totpCode) {
+    let secret = null;
+    try {
+      secret = buildStoredTotpSecret(mfa);
+    } catch (error) {
+      if (error.code !== 'MFA_SECRET_DECRYPT_FAILED') throw error;
+      console.error(`MFA secret for user ${user._id} cannot be decrypted with the configured keys`);
+      reason = 'SECRET_UNREADABLE';
+    }
 
-    if (matched) {
-      user.security.mfa.backupCodeHashes = remainingHashes;
-      user.security.mfa.lastVerifiedAt = new Date();
-      await user.save();
-      return { verified: true, method: 'recovery_code' };
+    if (secret) {
+      const result = verifyTotp(secret, totpCode, mfa.lastUsedTotpStep);
+      if (result.valid) {
+        const claimed = await User.updateOne(
+          {
+            _id: user._id,
+            $or: [
+              { 'security.mfa.lastUsedTotpStep': null },
+              { 'security.mfa.lastUsedTotpStep': { $lt: result.step } },
+            ],
+          },
+          {
+            $set: {
+              'security.mfa.lastUsedTotpStep': result.step,
+              'security.mfa.lastVerifiedAt': new Date(),
+            },
+          }
+        );
+        if (claimed.modifiedCount === 1) {
+          mfa.lastUsedTotpStep = result.step;
+          return { verified: true, method: 'totp' };
+        }
+        reason = 'CODE_REUSED';
+      } else if (result.replayed) {
+        reason = 'CODE_REUSED';
+      }
     }
   }
 
-  return { verified: false };
+  if (recoveryCode) {
+    const hashes = mfa.backupCodeHashes || [];
+    const { matched, remainingHashes } = await consumeRecoveryCode(recoveryCode, hashes);
+
+    if (matched) {
+      const usedHash = hashes.find((hash) => !remainingHashes.includes(hash));
+      const consumed = await User.updateOne(
+        { _id: user._id, 'security.mfa.backupCodeHashes': usedHash },
+        {
+          $pull: { 'security.mfa.backupCodeHashes': usedHash },
+          $set: { 'security.mfa.lastVerifiedAt': new Date() },
+        }
+      );
+      if (consumed.modifiedCount === 1) {
+        mfa.backupCodeHashes = remainingHashes;
+        return { verified: true, method: 'recovery_code' };
+      }
+    }
+  }
+
+  return { verified: false, reason };
 };
 
 exports.startSignup = async (req, res) => {
   try {
     if (handleValidationErrors(req, res)) return;
 
-    const email = String(req.body.email || '').toLowerCase().trim();
+    const email = canonicalEmail(req.body.email);
     const { name, pin, phone, securityVersion, userSalt, recoverySalt, wrappedUserKey, wrappedUserKeyRecovery } = req.body;
 
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
+    const existingUser = await findUserByEmail(email);
+    if (!(await releaseAbandonedAccount(existingUser))) {
       return res.status(400).json({
         success: false,
+        code: 'EMAIL_TAKEN',
         message: 'An account already exists with this email',
       });
+    }
+
+    if (phone) {
+      const phoneOwner = await User.findOne({ phone });
+      if (phoneOwner) {
+        return res.status(400).json({
+          success: false,
+          code: 'PHONE_TAKEN',
+          message: 'This phone number is already linked to another account',
+        });
+      }
     }
 
     const otpCode = generateNumericOtp(6);
@@ -199,14 +304,7 @@ exports.startSignup = async (req, res) => {
         recoverySalt: recoverySalt || null,
         wrappedUserKey: wrappedUserKey || null,
         wrappedUserKeyRecovery: wrappedUserKeyRecovery || null,
-        ...(() => {
-          const encryptedPin = encryptText(pin);
-          return {
-            pinEncrypted: encryptedPin.encrypted,
-            pinIv: encryptedPin.iv,
-            pinAuthTag: encryptedPin.authTag,
-          };
-        })(),
+        pinHash: await hashValue(pin),
         emailVerificationCodeHash: await hashValue(otpCode),
         emailVerificationExpiresAt: buildRegistrationExpiry(),
         emailVerificationSentAt: new Date(),
@@ -329,17 +427,28 @@ exports.verifySignupEmail = async (req, res) => {
       });
     }
 
-    const secret = generateMfaSecret(pending.email);
-    const encryptedSecret = encryptText(secret.base32);
+    if (pending.security?.mfa?.verifiedAt) {
+      return res.status(400).json({
+        success: false,
+        message: 'Authenticator is already verified for this registration. Continue to the recovery codes.',
+      });
+    }
 
-    pending.emailVerifiedAt = new Date();
-    pending.security.mfa.secretEncrypted = encryptedSecret.encrypted;
-    pending.security.mfa.secretIv = encryptedSecret.iv;
-    pending.security.mfa.secretAuthTag = encryptedSecret.authTag;
-    pending.security.mfa.verifiedAt = null;
-    pending.security.recoveryCodeHashes = [];
-    pending.security.recoveryCodesGeneratedAt = null;
-    pending.security.recoveryCodesConfirmedAt = null;
+    // Re-use the secret if one was already issued for this registration. Issuing a
+    // new one on every call would invalidate the QR code the user has already scanned.
+    let secretBase32;
+    if (pending.security?.mfa?.secretEncrypted) {
+      secretBase32 = buildStoredTotpSecret(pending.security.mfa);
+    } else {
+      const secret = generateMfaSecret(pending.email);
+      const encryptedSecret = encryptText(secret.base32);
+      secretBase32 = secret.base32;
+      pending.security.mfa.secretEncrypted = encryptedSecret.encrypted;
+      pending.security.mfa.secretIv = encryptedSecret.iv;
+      pending.security.mfa.secretAuthTag = encryptedSecret.authTag;
+    }
+
+    pending.emailVerifiedAt = pending.emailVerifiedAt || new Date();
     pending.expiresAt = buildRegistrationExpiry();
     await pending.save();
 
@@ -349,8 +458,8 @@ exports.verifySignupEmail = async (req, res) => {
       nextStep: 'setup_mfa',
       maskedEmail: maskValueByField('email', pending.email),
       expiresAt: pending.expiresAt,
-      secret: secret.base32,
-      qrCodeDataUrl: await buildQrCodeDataUrl(secret.otpauth_url),
+      secret: secretBase32,
+      qrCodeDataUrl: await buildQrCodeDataUrl(buildOtpauthUrl(pending.email, secretBase32)),
       message: 'Email verified. Scan the QR code with your authenticator app to continue.',
     });
   } catch (error) {
@@ -382,14 +491,17 @@ exports.verifySignupMfa = async (req, res) => {
     }
 
     const secret = buildStoredTotpSecret(pending.security?.mfa);
-    if (!secret || !verifyTotpCode(secret, req.body.totpCode)) {
+    const totpResult = verifyTotp(secret, req.body.totpCode);
+    if (!totpResult.valid) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid authenticator code',
+        code: 'MFA_INVALID_CODE',
+        message: 'Invalid authenticator code. Make sure you scanned the QR code shown on this page and that your phone time is set automatically.',
       });
     }
 
     const recoveryCodes = await createRecoveryCodes();
+    pending.security.mfa.lastUsedTotpStep = totpResult.step;
     pending.security.mfa.verifiedAt = new Date();
     pending.security.recoveryCodeHashes = recoveryCodes.hashedCodes;
     pending.security.recoveryCodesGeneratedAt = new Date();
@@ -440,7 +552,7 @@ exports.completeSignup = async (req, res) => {
       });
     }
 
-    const existingUser = await User.findOne({ email: pending.email });
+    const existingUser = await findUserByEmail(pending.email);
     if (existingUser) {
       await PendingRegistration.deleteOne({ _id: pending._id });
       return res.status(400).json({
@@ -449,15 +561,7 @@ exports.completeSignup = async (req, res) => {
       });
     }
 
-    const decryptedPin = pending.pinEncrypted
-      ? decryptText({
-          encrypted: pending.pinEncrypted,
-          iv: pending.pinIv,
-          authTag: pending.pinAuthTag,
-        })
-      : null;
-
-    if (pending.authMode === 'local' && !decryptedPin) {
+    if (pending.authMode === 'local' && !pending.pinHash) {
       return res.status(400).json({
         success: false,
         message: 'Registration data is invalid. Please restart signup.',
@@ -481,6 +585,7 @@ exports.completeSignup = async (req, res) => {
           backupCodeHashes: pending.security.recoveryCodeHashes,
           enabledAt: pending.security.mfa.verifiedAt,
           lastVerifiedAt: pending.security.mfa.verifiedAt,
+          lastUsedTotpStep: pending.security.mfa.lastUsedTotpStep ?? null,
           recoveryCodesGeneratedAt: pending.security.recoveryCodesGeneratedAt,
         },
       },
@@ -489,34 +594,35 @@ exports.completeSignup = async (req, res) => {
         google: pending.oauth?.provider === 'google',
         github: pending.oauth?.provider === 'github',
       },
-      providers: {
-        google: pending.oauth?.provider === 'google'
-          ? {
+      providers: pending.oauth?.provider === 'google'
+        ? {
+            google: {
               providerId: pending.oauth.providerId,
               email: pending.oauth.providerEmail || pending.email,
               emailVerified: !!pending.oauth.providerEmailVerified,
               linkedAt: new Date(),
               lastLoginAt: null,
               avatarUrl: pending.oauth.avatarUrl || null,
-            }
-          : undefined,
-        github: pending.oauth?.provider === 'github'
+            },
+          }
+        : pending.oauth?.provider === 'github'
           ? {
-              providerId: pending.oauth.providerId,
-              username: pending.oauth.providerUsername || null,
-              email: pending.oauth.providerEmail || pending.email,
-              emailVerified: !!pending.oauth.providerEmailVerified,
-              linkedAt: new Date(),
-              lastLoginAt: null,
-              avatarUrl: pending.oauth.avatarUrl || null,
-              profileUrl: pending.oauth.profileUrl || null,
+              github: {
+                providerId: pending.oauth.providerId,
+                username: pending.oauth.providerUsername || null,
+                email: pending.oauth.providerEmail || pending.email,
+                emailVerified: !!pending.oauth.providerEmailVerified,
+                linkedAt: new Date(),
+                lastLoginAt: null,
+                avatarUrl: pending.oauth.avatarUrl || null,
+                profileUrl: pending.oauth.profileUrl || null,
+              },
             }
-          : undefined,
-      },
+          : {},
     };
 
     if (pending.authMode === 'local') {
-      userPayload.pin = decryptedPin;
+      userPayload.pin = pending.pinHash;
     }
 
     userPayload.securityVersion = pending.securityVersion || 1;
@@ -540,6 +646,16 @@ exports.completeSignup = async (req, res) => {
     });
   } catch (error) {
     console.error('Complete signup error:', error.message);
+    if (error.code === 11000) {
+      const field = Object.keys(error.keyPattern || {})[0];
+      return res.status(409).json({
+        success: false,
+        code: 'DUPLICATE_ACCOUNT',
+        message: field === 'phone'
+          ? 'This phone number is already linked to another account.'
+          : 'An account already exists with this email.',
+      });
+    }
     return res.status(500).json({
       success: false,
       message: 'Unable to complete registration',
@@ -554,7 +670,7 @@ exports.login = async (req, res) => {
     const { email, pin } = req.body;
     const device = getDeviceContext(req);
 
-    const user = await User.findOne({ email });
+    const user = await findUserByEmail(email);
     if (!user) {
       return res.status(401).json({
         success: false,
@@ -570,6 +686,10 @@ exports.login = async (req, res) => {
       });
     }
 
+    if (user.status === 'suspended') {
+      return res.status(403).json(SUSPENDED_RESPONSE);
+    }
+
     if (!ensureActiveVerifiedMfaUser(user)) {
       return res.status(403).json({
         success: false,
@@ -577,9 +697,12 @@ exports.login = async (req, res) => {
       });
     }
 
+    const mfaResetRequired = !!user.security.mfa.resetRequired;
+
     return res.json({
       success: true,
       mfaRequired: true,
+      mfaResetRequired,
       challengeToken: signLoginChallenge({
         userId: user._id.toString(),
         deviceId: device.deviceId,
@@ -587,8 +710,10 @@ exports.login = async (req, res) => {
         deviceName: device.deviceName,
         clientType: device.clientType,
       }),
-      methods: ['totp', 'recovery_code'],
-      message: 'Enter your authenticator code to finish signing in.',
+      methods: mfaResetRequired ? ['email_otp'] : ['totp', 'recovery_code'],
+      message: mfaResetRequired
+        ? 'Your authenticator was reset. Verify with an email code to continue.'
+        : 'Enter your authenticator code to finish signing in.',
     });
   } catch (error) {
     console.error('Login error:', error.message);
@@ -614,6 +739,21 @@ exports.verifyLoginMfa = async (req, res) => {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
+    if (user.status === 'suspended') {
+      return res.status(403).json(SUSPENDED_RESPONSE);
+    }
+
+    // A challenge issued by the admin console only completes for a current admin, and only with
+    // the authenticator or a recovery code: the emailed-code shortcut is not available to staff.
+    if (challenge.authMethod === 'admin') {
+      if (user.role !== 'admin' && user.role !== 'superadmin') {
+        return res.status(401).json({ success: false, code: 'ADMIN_LOGIN_FAILED', message: 'Invalid email or password.' });
+      }
+      if (emailOtpCode) {
+        return res.status(403).json({ success: false, code: 'ADMIN_MFA_REQUIRED', message: 'Staff sign in with the authenticator app or a recovery code.' });
+      }
+    }
+
     if (!ensureActiveVerifiedMfaUser(user)) {
       return res.status(403).json({ success: false, message: 'Account setup is incomplete.' });
     }
@@ -631,13 +771,14 @@ exports.verifyLoginMfa = async (req, res) => {
         }
       }
       if (!verified) {
-        return res.status(401).json({ success: false, message: 'Invalid or expired email OTP.' });
+        return res.status(401).json({ success: false, code: 'EMAIL_OTP_INVALID', message: 'Invalid or expired email OTP.' });
       }
     } else {
       // TOTP / recovery code path
       const verification = await verifyMfaAttempt(user, { totpCode, recoveryCode });
       if (!verification.verified) {
-        return res.status(401).json({ success: false, message: 'Invalid MFA code' });
+        const failure = mfaFailure(verification.reason);
+        return res.status(failure.status).json({ success: false, code: failure.code, message: failure.message });
       }
     }
 
@@ -648,14 +789,28 @@ exports.verifyLoginMfa = async (req, res) => {
       clientType: challenge.clientType,
     });
 
+    if (challenge.authMethod === 'admin') {
+      try {
+        await AdminAuditLog.create({
+          actorId: user._id,
+          actorEmail: user.email,
+          action: 'admin.signed_in',
+          details: { device: challenge.deviceName || 'Unknown device' },
+          ipHash: hashIpAddress(getClientIp(req)),
+        });
+      } catch (auditError) {
+        console.error('AUDIT WRITE FAILED for admin.signed_in:', auditError.message);
+      }
+    }
+
     return res.json({ ...buildAuthResponse(user, session), message: 'Login successful' });
   } catch (error) {
     console.error('Login MFA verification error:', error.message);
     if (error.code === 'LOGIN_CHALLENGE_EXPIRED') {
-      return res.status(400).json({ success: false, message: 'Login challenge expired. Start sign-in again.' });
+      return res.status(400).json({ success: false, code: 'LOGIN_CHALLENGE_EXPIRED', message: 'Login challenge expired. Start sign-in again.' });
     }
     if (error.code === 'LOGIN_CHALLENGE_INVALID') {
-      return res.status(400).json({ success: false, message: 'Login challenge is invalid. Start sign-in again.' });
+      return res.status(400).json({ success: false, code: 'LOGIN_CHALLENGE_INVALID', message: 'Login challenge is invalid. Start sign-in again.' });
     }
     return res.status(error.status || 500).json({ success: false, message: 'Unable to verify MFA right now' });
   }
@@ -718,7 +873,7 @@ exports.stepUp = async (req, res) => {
   try {
     const { method, pin, totpCode, recoveryCode } = req.body;
 
-    if (!method || !['pin', 'totp', 'recovery_code'].includes(method)) {
+    if (!method || !['pin', 'password', 'totp', 'recovery_code'].includes(method)) {
       return res.status(400).json({
         success: false,
         message: 'A valid step-up method is required',
@@ -726,18 +881,26 @@ exports.stepUp = async (req, res) => {
     }
 
     let verified = false;
+    let stepUpReason = 'INVALID';
 
     if (method === 'pin') {
       verified = await req.user.comparePin(pin || '');
+    } else if (method === 'password') {
+      // Staff re-authenticate with the console password. Anyone without one simply fails.
+      verified = await compareAdminPassword(req.body.password, req.user.adminPasswordHash);
     } else {
       const verification = await verifyMfaAttempt(req.user, { totpCode, recoveryCode });
       verified = verification.verified;
+      stepUpReason = verification.reason;
     }
 
     if (!verified) {
-      return res.status(401).json({
+      const knowledge = method === 'pin' || method === 'password';
+      const failure = knowledge ? MFA_FAILURES.INVALID : mfaFailure(stepUpReason);
+      return res.status(failure.status).json({
         success: false,
-        message: 'Re-authentication failed',
+        code: knowledge ? 'STEP_UP_FAILED' : failure.code,
+        message: knowledge ? 'Re-authentication failed' : failure.message,
       });
     }
 
@@ -789,11 +952,10 @@ exports.updateEmail = async (req, res) => {
   try {
     if (handleValidationErrors(req, res)) return;
 
-    const { email } = req.body;
-    const normalizedEmail = String(email || '').toLowerCase().trim();
+    const normalizedEmail = canonicalEmail(req.body.email);
 
     const existingUser = await User.findOne({
-      email: normalizedEmail,
+      email: { $in: emailCandidates(normalizedEmail) },
       _id: { $ne: req.userId },
     });
 
@@ -970,6 +1132,9 @@ exports.sendMfaEmailOtp = async (req, res) => {
     if (!user || !user.isVerified) {
       return res.status(404).json({ success: false, message: 'User not found.' });
     }
+    if (user.status === 'suspended') {
+      return res.status(403).json(SUSPENDED_RESPONSE);
+    }
 
     const otp = generateNumericOtp(6);
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
@@ -996,14 +1161,15 @@ exports.requestLoginOtp = async (req, res) => {
   try {
     if (handleValidationErrors(req, res)) return;
 
-    const email = String(req.body.email || '').toLowerCase().trim();
-    const user = await User.findOne({ email });
+    const typedEmail = canonicalEmail(req.body.email);
+    const user = await findUserByEmail(typedEmail);
 
     // Always respond success to avoid email enumeration
     if (!user || !user.isVerified) {
       return res.json({ success: true, message: 'If that email exists, a code was sent.' });
     }
 
+    const email = user.email;
     const otp = generateNumericOtp(6);
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
 
@@ -1026,10 +1192,14 @@ exports.verifyLoginOtp = async (req, res) => {
   try {
     if (handleValidationErrors(req, res)) return;
 
-    const email = String(req.body.email || '').toLowerCase().trim();
     const { code } = req.body;
 
-    const challenge = await LoginOtpChallenge.findOne({ email, used: false });
+    const user = await findUserByEmail(canonicalEmail(req.body.email));
+    if (!user) {
+      return res.status(400).json({ success: false, message: 'OTP expired or not found. Request a new one.' });
+    }
+
+    const challenge = await LoginOtpChallenge.findOne({ email: user.email, used: false });
 
     if (!challenge || new Date(challenge.expiresAt).getTime() <= Date.now()) {
       return res.status(400).json({ success: false, message: 'OTP expired or not found. Request a new one.' });
@@ -1042,11 +1212,6 @@ exports.verifyLoginOtp = async (req, res) => {
     // Mark used
     challenge.used = true;
     await challenge.save();
-
-    const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found.' });
-    }
 
     // If MFA is enabled, still require TOTP after OTP
     if (ensureActiveVerifiedMfaUser(user)) {
@@ -1084,8 +1249,8 @@ exports.forgotPassword = async (req, res) => {
   try {
     if (handleValidationErrors(req, res)) return;
 
-    const email = String(req.body.email || '').toLowerCase().trim();
-    const user = await User.findOne({ email });
+    const typedEmail = canonicalEmail(req.body.email);
+    const user = await findUserByEmail(typedEmail);
 
     // Always respond with success to prevent email enumeration
     if (!user || !user.isVerified) {
@@ -1105,6 +1270,7 @@ exports.forgotPassword = async (req, res) => {
       });
     }
 
+    const email = user.email;
     const otp = generateNumericOtp(6);
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
 
@@ -1139,10 +1305,9 @@ exports.verifyResetCode = async (req, res) => {
   try {
     if (handleValidationErrors(req, res)) return;
 
-    const email = String(req.body.email || '').toLowerCase().trim();
     const code = String(req.body.code || '');
 
-    const user = await User.findOne({ email });
+    const user = await findUserByEmail(canonicalEmail(req.body.email));
     if (!user || !user.isVerified) {
       return res.status(404).json({
         success: false,
@@ -1151,7 +1316,7 @@ exports.verifyResetCode = async (req, res) => {
     }
 
     const resetRequest = await PasswordReset.findOne({
-      email,
+      email: user.email,
       used: false,
     });
 
@@ -1198,7 +1363,6 @@ exports.resetPassword = async (req, res) => {
   try {
     if (handleValidationErrors(req, res)) return;
 
-    const email = String(req.body.email || '').toLowerCase().trim();
     const code = String(req.body.code || '');
     const newPin = String(req.body.newPin || '');
 
@@ -1209,7 +1373,7 @@ exports.resetPassword = async (req, res) => {
       });
     }
 
-    const user = await User.findOne({ email });
+    const user = await findUserByEmail(canonicalEmail(req.body.email));
     if (!user || !user.isVerified) {
       return res.status(404).json({
         success: false,
@@ -1218,7 +1382,7 @@ exports.resetPassword = async (req, res) => {
     }
 
     const resetRequest = await PasswordReset.findOne({
-      email,
+      email: user.email,
       used: false,
     });
 
@@ -1281,8 +1445,7 @@ exports.checkEmail = async (req, res) => {
   try {
     if (handleValidationErrors(req, res)) return;
 
-    const email = String(req.body.email || '').toLowerCase().trim();
-    const user = await User.findOne({ email });
+    const user = await findUserByEmail(canonicalEmail(req.body.email));
 
     return res.json({
       success: true,
@@ -1318,8 +1481,7 @@ exports.getKeys = async (req, res) => {
   }
 };
 
-// In-memory temporary store for pending TOTP setup
-const pendingTotpSetups = new Map();
+const PENDING_TOTP_TTL_MS = 10 * 60 * 1000;
 
 exports.setupNewTotp = async (req, res) => {
   try {
@@ -1330,15 +1492,15 @@ exports.setupNewTotp = async (req, res) => {
 
     const secret = generateMfaSecret(user.email);
     const qrCodeDataUrl = await buildQrCodeDataUrl(secret.otpauth_url);
+    const encryptedSecret = encryptText(secret.base32);
 
-    pendingTotpSetups.set(user._id.toString(), {
-      secretBase32: secret.base32,
-      createdAt: Date.now(),
-    });
-
-    setTimeout(() => {
-      pendingTotpSetups.delete(user._id.toString());
-    }, 10 * 60 * 1000);
+    // Persisted (encrypted) so the pending setup survives restarts and multiple
+    // instances; calling setup again simply replaces it.
+    user.security.mfa.pendingSecretEncrypted = encryptedSecret.encrypted;
+    user.security.mfa.pendingSecretIv = encryptedSecret.iv;
+    user.security.mfa.pendingSecretAuthTag = encryptedSecret.authTag;
+    user.security.mfa.pendingSecretCreatedAt = new Date();
+    await user.save();
 
     return res.json({
       success: true,
@@ -1354,29 +1516,38 @@ exports.setupNewTotp = async (req, res) => {
 
 exports.confirmNewTotp = async (req, res) => {
   try {
-    const { totpCode } = req.body;
-    if (!totpCode) {
-      return res.status(400).json({ success: false, message: 'Authenticator code is required' });
-    }
+    if (handleValidationErrors(req, res)) return;
 
-    const pending = pendingTotpSetups.get(req.userId.toString());
-    if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
+    const user = await User.findById(req.userId);
+    const mfa = user?.security?.mfa;
+    const createdAt = mfa?.pendingSecretCreatedAt ? new Date(mfa.pendingSecretCreatedAt).getTime() : 0;
+
+    if (!mfa?.pendingSecretEncrypted || Date.now() - createdAt > PENDING_TOTP_TTL_MS) {
       return res.status(400).json({
         success: false,
+        code: 'TOTP_SETUP_EXPIRED',
         message: 'Authenticator setup session expired. Please click Setup Authenticator again.',
       });
     }
 
-    const isValid = verifyTotpCode(pending.secretBase32, totpCode);
-    if (!isValid) {
-      return res.status(400).json({ success: false, message: 'Invalid 6-digit code. Please try again.' });
+    const pendingSecret = decryptText({
+      encrypted: mfa.pendingSecretEncrypted,
+      iv: mfa.pendingSecretIv,
+      authTag: mfa.pendingSecretAuthTag,
+    });
+
+    const result = verifyTotp(pendingSecret, req.body.totpCode);
+    if (!result.valid) {
+      return res.status(400).json({
+        success: false,
+        code: 'MFA_INVALID_CODE',
+        message: 'Invalid 6-digit code. Please try again.',
+      });
     }
 
-    const user = await User.findById(req.userId);
-    const { encrypted, iv, authTag } = encryptText(pending.secretBase32);
+    const { encrypted, iv, authTag } = encryptText(pendingSecret);
     const recovery = await createRecoveryCodes();
 
-    user.security = user.security || {};
     user.security.mfa = {
       enabled: true,
       secretEncrypted: encrypted,
@@ -1385,11 +1556,11 @@ exports.confirmNewTotp = async (req, res) => {
       backupCodeHashes: recovery.hashedCodes,
       enabledAt: new Date(),
       lastVerifiedAt: new Date(),
+      lastUsedTotpStep: result.step,
       recoveryCodesGeneratedAt: new Date(),
     };
 
     await user.save();
-    pendingTotpSetups.delete(req.userId.toString());
 
     return res.json({
       success: true,

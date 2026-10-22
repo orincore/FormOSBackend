@@ -45,7 +45,7 @@ const documentSchema = new mongoose.Schema({
   // S3 specific fields
   storageType: {
     type: String,
-    enum: ['local', 's3', 'gridfs'],
+    enum: ['local', 's3', 'gridfs', 'r2'],
     default: 'local'
   },
   s3Key: {

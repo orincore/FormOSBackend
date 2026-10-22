@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 const { GridFSBucket } = require('mongodb');
 const fs = require('fs/promises');
 const path = require('path');
-const { isS3Configured, uploadToS3, downloadFromS3, deleteFromS3 } = require('./s3Service');
+const { isS3Configured, isR2Configured, putObject, uploadToS3, downloadFromS3, deleteFromS3 } = require('./s3Service');
 
 let bucket;
 const getGridFSBucket = () => {
@@ -109,8 +109,8 @@ const StorageService = {
   },
 
   downloadFile: async (document) => {
-    if (document.securityVersion === 2 && document.storageType !== 'gridfs') {
-      throw new Error('Security Violation: Security V2 documents must use GridFS storage. S3/local fallback is blocked.');
+    if (document.securityVersion === 2 && !['gridfs', 'r2'].includes(document.storageType)) {
+      throw new Error('Security Violation: Security V2 documents must use GridFS or R2 storage. S3/local fallback is blocked.');
     }
 
     if (document.storageType === 'gridfs') {
@@ -118,6 +118,9 @@ const StorageService = {
         throw new Error('GridFS file ID is missing from document');
       }
       return await downloadFromGridFS(document.gridfsId);
+    } else if (document.storageType === 'r2') {
+      if (!document.s3Key) throw new Error('Storage key is missing from document');
+      return await downloadFromS3(document.s3Key);
     } else if (document.storageType === 's3') {
       return await downloadFromS3(document.s3Key);
     } else if (document.storageType === 'local') {
@@ -128,13 +131,17 @@ const StorageService = {
   },
 
   deleteFile: async (document) => {
-    if (document.securityVersion === 2 && document.storageType !== 'gridfs') {
-      throw new Error('Security Violation: Security V2 documents must use GridFS storage. S3/local fallback is blocked.');
+    if (document.securityVersion === 2 && !['gridfs', 'r2'].includes(document.storageType)) {
+      throw new Error('Security Violation: Security V2 documents must use GridFS or R2 storage. S3/local fallback is blocked.');
     }
 
     if (document.storageType === 'gridfs') {
       if (document.gridfsId) {
         await deleteFromGridFS(document.gridfsId);
+      }
+    } else if (document.storageType === 'r2') {
+      if (document.s3Key) {
+        await deleteFromS3(document.s3Key);
       }
     } else if (document.storageType === 's3') {
       if (document.s3Key) {
@@ -145,6 +152,24 @@ const StorageService = {
         await deleteLocal(document.filePath);
       }
     }
+  },
+
+  // Stores an already-encrypted (Security V2) file: in Cloudflare R2 when it is set up, otherwise GridFS.
+  // Only ciphertext may be passed in. Returns the fields to save on the document record.
+  uploadEncrypted: async (buffer, mimeType, userId) => {
+    if (isR2Configured()) {
+      const key = `encrypted/${userId}/${Date.now()}-${Math.round(Math.random() * 1E9)}.bin`;
+      await putObject(key, buffer, 'application/octet-stream');
+      return { storageType: 'r2', s3Key: key, filePath: key, fileSize: buffer.length };
+    }
+    const gridfsId = await uploadToGridFS(buffer, 'encrypted_blob', mimeType);
+    return { storageType: 'gridfs', gridfsId, filePath: gridfsId.toString(), fileSize: buffer.length };
+  },
+
+  // Removes whatever uploadEncrypted stored, for cleanup when saving the record fails.
+  discardEncrypted: async (stored) => {
+    if (stored.storageType === 'r2') await deleteFromS3(stored.s3Key);
+    else await deleteFromGridFS(stored.gridfsId);
   },
 
   // Export raw GridFS functions for transaction/cleanup handling

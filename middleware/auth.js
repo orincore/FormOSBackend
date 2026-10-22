@@ -42,6 +42,14 @@ const authMiddleware = async (req, res, next) => {
       });
     }
 
+    if (user.status === 'suspended') {
+      return res.status(403).json({
+        success: false,
+        code: 'ACCOUNT_SUSPENDED',
+        message: 'This account has been suspended. Contact support for help.',
+      });
+    }
+
     if (!user.isVerified || !user.emailVerifiedAt || !user.security?.mfa?.enabled) {
       console.log('DEBUG AUTH 403:', {
         email: user.email,
