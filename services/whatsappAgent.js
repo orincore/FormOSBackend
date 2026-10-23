@@ -5,7 +5,7 @@ const StorageService = require('./storageService');
 const { decryptPayload, encryptPayload, decryptFileEnvelope } = require('./vaultCrypto');
 const User = require('../models/User');
 const Document = require('../models/Document');
-const { evaluateEligibility } = require('../controllers/eligibilityController');
+const { evaluateEligibility, looksLikeJob } = require('../controllers/eligibilityController');
 const { requestedFields, limitTo, documentDetailsFor, wantsEverything, DOC_WORDS } = require('./whatsappFields');
 const docFields = require('./documentFields');
 const docKind = require('./whatsappDocKind');
@@ -345,6 +345,13 @@ async function tryCorrection(ctx) {
   return { text: `Done. I changed your ${FIELD_LABEL[key].toLowerCase()} to *${show(key, checked.value, ctx.unlocked)}*${docs ? ` on your profile and ${docs} document${docs === 1 ? '' : 's'}` : ' on your profile'}.` };
 }
 
+// ---- a job waiting for the resume ----------------------------------------------------------------------------------------------
+// When a job is sent before a resume exists, the job is kept (in memory, thirty minutes) so the check can run as soon as the resume is added.
+const pendingJobs = new Map();
+const JOB_WAIT_MS = 30 * 60 * 1000;
+const peekPendingJob = (userId) => { const p = pendingJobs.get(String(userId)); return p && Date.now() - p.at < JOB_WAIT_MS ? p.jd : null; };
+const takePendingJob = (userId) => { const jd = peekPendingJob(userId); pendingJobs.delete(String(userId)); return jd; };
+
 // ---- the tools -----------------------------------------------------------------------------------------------
 const needsVault = (ctx) => {
   if (ctx.user.securityVersion === 2) {
@@ -628,10 +635,26 @@ const TOOLS = {
     description: "Check whether the member qualifies for a job, scholarship, government scheme, loan or any opportunity. Pass the rules or the name of the scheme.",
     parameters: { type: 'object', properties: { requirements: { type: 'string', description: 'The eligibility rules, or the name of the scheme' } }, required: ['requirements'] },
     async run(ctx, { requirements }) {
-      const rules = String(requirements || '').trim();
-      if (rules.replace(/\b(please|check|my|eligibility|eligible|for|am|i|am i)\b/gi, '').trim().length < 4) return { text: 'Tell me what to check, for example "am I eligible for the PM Kisan scheme?".' };
+      let rules = String(requirements || '').trim();
+      const id = String(ctx.user._id);
+      // "check again" after the resume was added: the job the member sent before is used.
+      if (/^\W*(?:please\s+)?(?:check|try|run|do)?\s*(?:it|that|this|the job)?\s*again\W*$/i.test(rules) || /^\W*(?:please\s+)?(?:check|try|run|do)\s*(?:it|that|this|the job)?\s*again\W*$/i.test(ctx.text)) {
+        const saved = peekPendingJob(id);
+        if (!saved) return { text: 'I do not have a job saved to check. Send me the job description and I will check it.' };
+        rules = saved;
+      }
+      if (rules.replace(/\b(please|check|my|eligibility|eligible|for|am|i|am i)\b/gi, '').trim().length < 4) return { text: 'Tell me what to check, for example "am I eligible for the PM Kisan scheme?", or paste a job description.' };
       const opened = ctx.user.securityVersion === 2 ? ctx.entry : null;
-      const result = await evaluateEligibility(ctx.user, rules, opened ? { v2Facts: ctx.deps.v2Facts(opened.data) } : {});
+      const skipResume = /\bwithout\s+(?:a\s+|my\s+|the\s+)?resume\b/i.test(ctx.text);
+      const result = await evaluateEligibility(ctx.user, rules, { ...(opened ? { v2Facts: ctx.deps.v2Facts(opened.data) } : {}), skipResume });
+      if (result.needsResume) {
+        // A job is judged against a resume. The job is kept for a while, so adding the resume here finishes the check by itself.
+        pendingJobs.set(id, { jd: rules, at: Date.now() });
+        if (pendingJobs.size > 2000) pendingJobs.delete(pendingJobs.keys().next().value);
+        return { text: result.chatMessage };
+      }
+      // The saved job is used up only when it is the one that was just checked.
+      if (peekPendingJob(id) === rules) pendingJobs.delete(id);
       return { text: ctx.deps.formatEligibility(result) };
     },
   },
@@ -831,6 +854,19 @@ async function run(ctx) {
     throw error;
   }
 
+  // "check again" (after the resume was added) or "check it without resume" refers to the job kept earlier: handled in code.
+  if (ctx.user.securityVersion !== 2 && peekPendingJob(ctx.user._id)
+    && (/^\W*(?:please\s+)?(?:check|try|run|do)\s*(?:it|that|this|the job)?\s*again\W*$/i.test(ctx.text) || /^\W*again\W*$/i.test(ctx.text) || /\bwithout\s+(?:a\s+|my\s+|the\s+)?resume\b/i.test(ctx.text))) {
+    apply(await TOOLS.check_eligibility.run(ctx, { requirements: 'check again' }), 'check_eligibility');
+    return result;
+  }
+
+  // A pasted job description is checked against the resume (or the member is asked for one), whatever tool the model would pick.
+  if (ctx.user.securityVersion !== 2 && String(ctx.text).length >= 140 && looksLikeJob(ctx.text)) {
+    apply(await TOOLS.check_eligibility.run(ctx, { requirements: ctx.text }), 'check_eligibility');
+    return result;
+  }
+
   // "Licence: MH05 2022000047" is a request to save that detail.
   const labelled = parseLabelValue(ctx.text);
   if (labelled) {
@@ -940,4 +976,4 @@ async function executeDelete(ctx, pending) {
   return { text: `Deleted *${pending.name}*.` };
 }
 
-module.exports = { dataDeletion, parseLabelValue, clearFocus, parseCorrection, replaceFragment, answerGrounded, recordsFor, run, executeDelete, parseSaveStatements, cleanFields, impliedCall, TOOLS, toolDefs, PinRequired, resolveDoc };
+module.exports = { takePendingJob, peekPendingJob, dataDeletion, parseLabelValue, clearFocus, parseCorrection, replaceFragment, answerGrounded, recordsFor, run, executeDelete, parseSaveStatements, cleanFields, impliedCall, TOOLS, toolDefs, PinRequired, resolveDoc };

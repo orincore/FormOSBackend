@@ -107,9 +107,25 @@ Do not assume the candidate holds any document, qualification, job, address or a
   return context;
 }
 
+// Is this the description of a job (not a scheme, loan or scholarship)? A job is judged against a resume, so one is needed first.
+const JOB_WORDS = /\b(job|jobs|role|position|vacanc(?:y|ies)|opening|hiring|recruit\w*|employment|employer|full[- ]?time|part[- ]?time|internship|intern|fresher|work experience|years? of experience|\d+\+?\s*(?:years?|yrs?)|responsibilit\w+|skills?|qualifications?|salary|ctc|lpa|engineer|developer|manager|analyst|designer|executive|consultant|architect|administrator|associate|officer|assistant|programmer|tester|devops|backend|frontend|full[- ]?stack)\b/gi;
+function looksLikeJob(text) {
+  const hits = new Set((String(text || '').match(JOB_WORDS) || []).map((w) => w.toLowerCase()));
+  const other = /\b(scholarship|scheme|yojana|subsidy|loan|visa|pension|housing|grant|fellowship)\b/i.test(text);
+  return other ? hits.size >= 5 : hits.size >= 2;
+}
+
+const NEEDS_RESUME = {
+  needsResume: true,
+  message: 'Job checks use your resume, and you have not added one yet. Add your resume in Documents on the portal, or send it here in WhatsApp as a PDF or photo. Then ask again.',
+  chatMessage: 'Job checks use your resume, and I do not have one for you yet.\n\nSend your resume here as a PDF or a photo, or add it in Documents on the portal. I will keep this job, and once your resume is read I will check it for you.',
+};
+
 // The whole check, shared by the app and the WhatsApp assistant: builds the profile from what is
 // stored, asks the AI, and returns a clean result. Throws with httpStatus on failure.
 async function evaluateEligibility(user, jd, extra = {}) {
+  // A job needs a resume first (standard accounts, where the documents can be read). The caller shows the message; nothing is judged.
+  if (user.securityVersion !== 2 && !extra.skipResume && looksLikeJob(jd) && !(await require('../services/documentRecords').findResume(user._id))) return NEEDS_RESUME;
   const context = await buildContext(user, extra.v2Facts || null);
 
   const systemPrompt = `You are a universal eligibility assessment expert. You evaluate whether a person meets the requirements for ANY type of opportunity: jobs, government schemes, scholarships, loans, housing, welfare programs, internships, visas, or any other application.
@@ -182,6 +198,8 @@ JSON:`;
 }
 
 exports.evaluateEligibility = evaluateEligibility;
+exports.looksLikeJob = looksLikeJob;
+exports.NEEDS_RESUME = NEEDS_RESUME;
 exports.ageFrom = ageFrom;
 
 exports.checkEligibility = async (req, res) => {
@@ -201,7 +219,8 @@ exports.checkEligibility = async (req, res) => {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    const result = await evaluateEligibility(user, jd);
+    const result = await evaluateEligibility(user, jd, { skipResume: req.body.skipResume === true });
+    if (result.needsResume) return res.json({ success: true, needsResume: true, message: result.message });
     res.json({ success: true, data: result });
 
   } catch (error) {
@@ -219,5 +238,17 @@ exports.checkEligibility = async (req, res) => {
       });
     }
     res.status(500).json({ success: false, message: 'Error checking eligibility' });
+  }
+};
+
+// GET /api/eligibility/context: what a check will use, so the page can say so before anything is pasted.
+exports.context = async (req, res) => {
+  try {
+    const documentRecords = require('../services/documentRecords');
+    const resume = await documentRecords.findResume(req.userId);
+    const documents = await Document.countDocuments({ userId: req.userId, securityVersion: { $ne: 2 }, ocrStatus: 'completed' });
+    return res.json({ success: true, resume: resume ? { title: resume.structuredData?.documentTitle || resume.originalName, addedAt: resume.uploadedAt } : null, documents });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Could not load what the check will use.' });
   }
 };

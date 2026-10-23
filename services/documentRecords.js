@@ -42,4 +42,12 @@ async function recordsFor(user, { profile = true, limit = 25, maxChars = 40000 }
   return blocks;
 }
 
-module.exports = { recordsFor, maskIds, KIND_LABEL };
+// The member's newest resume, or null. A resume is a document the AI read and named as one.
+async function findResume(userId) {
+  return Document.findOne({
+    userId, securityVersion: { $ne: 2 }, ocrStatus: 'completed',
+    $or: [{ 'structuredData.documentType': 'resume' }, { 'structuredData.documentTitle': /resume|curriculum vitae|\bcv\b/i }],
+  }).sort({ uploadedAt: -1 }).select('originalName uploadedAt structuredData.documentTitle').lean();
+}
+
+module.exports = { recordsFor, findResume, maskIds, KIND_LABEL };

@@ -465,6 +465,23 @@ function formatEligibility(r) {
   return lines.join('\n');
 }
 
+// A job was sent before the resume existed. Now that a resume has been read, the job the member sent is checked for them.
+async function checkPendingJob(msg, user, documentId) {
+  try {
+    const doc = await Document.findById(documentId).select('ocrStatus structuredData.documentType structuredData.documentTitle').lean();
+    const isResume = doc?.ocrStatus === 'completed' && (doc.structuredData?.documentType === 'resume' || /resume|curriculum vitae|\bcv\b/i.test(doc.structuredData?.documentTitle || ''));
+    if (!isResume) return;
+    const jd = agent.takePendingJob(user._id);
+    if (!jd) return;
+    await msg.reply('That is your resume. I kept the job you sent earlier, so I am checking it now.');
+    const { evaluateEligibility } = require('../controllers/eligibilityController');
+    const result = await evaluateEligibility(await User.findById(user._id), jd);
+    await msg.reply(clip(result.needsResume ? result.chatMessage : formatEligibility(result)));
+  } catch (error) {
+    console.warn(`[whatsapp] could not check the saved job: ${error.message}`);
+  }
+}
+
 async function describeUpload(documentId, reveal = false, userId = null) {
   const ask = (guess) => (userId ? `\n\n${askKind(userId, documentId, false, guess)}` : '');
   const deadline = Date.now() + READ_WAIT_MS;
@@ -657,6 +674,7 @@ async function handleIncoming(msg, wa) {
       }
       await msg.reply('Got it. Reading your document now, this takes a few seconds.');
       await msg.reply(clip(await describeUpload(document._id, revealActive(user._id), user._id)));
+      await checkPendingJob(msg, user, document._id);
       stats.answered += 1; stats.lastAnsweredAt = Date.now();
       return;
     }
@@ -774,6 +792,7 @@ async function handleIncoming(msg, wa) {
 }
 
 exports.handleIncoming = handleIncoming;
+exports.checkPendingJob = checkPendingJob;
 exports.askKind = askKind;
 exports.handleKindReply = handleKindReply;
 exports.attach = (wa) => wa.onMessage(handleIncoming);
