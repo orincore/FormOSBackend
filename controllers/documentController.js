@@ -8,9 +8,14 @@ const { isS3Configured, isR2Configured, downloadFromS3, deleteFromS3 } = require
 const { maskSensitiveText, maskStructuredData } = require('../services/securityService');
 const StorageService = require('../services/storageService');
 const docFields = require('../services/documentFields');
+const documentReader = require('../services/documentReader');
+const { buildPreview, makeThumbnail } = require('../services/documentPreview');
+const docKind = require('../services/whatsappDocKind');
+const TOP_LEVEL_TYPES = new Set(['aadhaar', 'pan', 'passport', 'license']);
 const { flags } = require('../config/featureFlags');
 
 const serializeDocument = (document, { reveal = false } = {}) => ({
+  ...(document.securityVersion === 2 ? {} : { thumbnail: document.thumbnail || '', preview: buildPreview(document) }),
   id: document._id,
   originalName: document.originalName,
   documentType: document.documentType,
@@ -20,8 +25,8 @@ const serializeDocument = (document, { reveal = false } = {}) => ({
   storageType: document.storageType,
   uploadedAt: document.uploadedAt,
   structuredData: reveal
-    ? (document.securityVersion === 2 ? document.structuredData || {} : docFields.cleanKnown(document.structuredData || {}))
-    : maskStructuredData(document.securityVersion === 2 ? document.structuredData || {} : docFields.cleanKnown(document.structuredData || {})),
+    ? docFields.cleanKnown(document.structuredData || {})
+    : maskStructuredData(docFields.cleanKnown(document.structuredData || {})),
   extractedText: reveal ? document.extractedText || '' : maskSensitiveText(document.extractedText || ''),
   ...(document.securityVersion === 2 ? {
     encryptedText: document.encryptedText || null,
@@ -34,7 +39,7 @@ const serializeDocument = (document, { reveal = false } = {}) => ({
 
 // Stores one plain (Security V1) document and starts reading it. Used by the app upload and by the
 // WhatsApp assistant, so a file sent in either place goes through exactly the same steps.
-async function savePlainDocument({ userId, buffer, originalName, mimeType, documentType, skipOcr = false }) {
+async function savePlainDocument({ userId, buffer, originalName, mimeType, documentType, skipOcr = false, migratedFrom = null }) {
   const uploadResult = await StorageService.uploadFile(buffer, originalName, mimeType, userId, false);
 
   const document = await Document.create({
@@ -50,7 +55,8 @@ async function savePlainDocument({ userId, buffer, originalName, mimeType, docum
     s3Key: uploadResult.s3Key || null,
     s3Location: uploadResult.s3Location || null,
     securityVersion: 1,
-    encryptionVersion: 0
+    encryptionVersion: 0,
+    ...(migratedFrom ? { migratedFrom } : {})
   });
 
   // Fetch the file from wherever this file was actually stored.
@@ -59,6 +65,19 @@ async function savePlainDocument({ userId, buffer, originalName, mimeType, docum
 }
 
 exports.savePlainDocument = savePlainDocument;
+
+// Reads an already stored standard document again with the AI reader (used once for documents saved by the older reader). The
+// member's profile is left as it is, so an old document cannot overwrite newer details.
+exports.reprocessDocument = async (document) => {
+  const buffer = await StorageService.downloadFile(document);
+  const temp = path.join(os.tmpdir(), `reread-${Date.now()}-${path.basename(document.originalName || 'file')}`);
+  await fs.writeFile(temp, buffer);
+  try {
+    await processOCR(document._id, temp, document.userId, false, { updateProfile: false, requireAi: true });
+  } finally {
+    await fs.unlink(temp).catch(() => {});
+  }
+};
 exports.PLAIN_UPLOAD_TYPES = ['image/jpeg', 'image/png', 'application/pdf'];
 
 exports.uploadDocument = async (req, res) => {
@@ -292,7 +311,7 @@ exports.uploadSecureV2Document = async (req, res) => {
   }
 };
 
-async function processOCR(documentId, filePathOrKey, userId, useS3 = false) {
+async function processOCR(documentId, filePathOrKey, userId, useS3 = false, { updateProfile = true, requireAi = false } = {}) {
   try {
     await Document.findByIdAndUpdate(documentId, { ocrStatus: 'processing' });
 
@@ -306,42 +325,86 @@ async function processOCR(documentId, filePathOrKey, userId, useS3 = false) {
       filePath = tempFilePath;
     }
 
-    const { text: extractedText, items: layoutItems } = await ocrService.extractTextAndItems(filePath);
     const owner = await User.findById(userId);
-    const structuredData = await ocrService.extractWithAI(extractedText, ocrService.parseStructuredData(extractedText), require('../services/aiService'), owner);
+    const aiService = require('../services/aiService');
+    const named = await Document.findById(documentId).select('originalName mimeType migratedFrom').lean();
+
+    // The AI model reads the file itself (the picture, or the PDF pages) and returns its kind, the holder's details and every
+    // labelled item. No OCR is involved. Only if the AI cannot be used at all does the older OCR-based reading below run, so an
+    // upload is never lost.
+    const fileBuffer = await fs.readFile(filePath);
+    // A copy made while moving off Security V2 is read for the owner as a standard document (they asked for exactly that).
+    const readAs = named?.migratedFrom ? { _id: owner._id, securityVersion: 1 } : owner;
+    const read = await documentReader.read({ buffer: fileBuffer, mimeType: named?.mimeType, fileName: named?.originalName, user: readAs });
+    // A re-read of an older document only goes ahead if the AI could read it: otherwise the earlier data stays untouched.
+    if (!read && requireAi) {
+      await Document.findByIdAndUpdate(documentId, { ocrStatus: 'completed' });
+      return;
+    }
+    let extractedText = '';
+    let layoutItems = [];
+    if (!read) {
+      ({ text: extractedText, items: layoutItems } = await ocrService.extractTextAndItems(filePath));
+    }
+
+    let structuredData;
+    let dynamic;
+    let stored;
+    if (read) {
+      structuredData = { ...read.known };
+      if (read.documentType !== 'other') structuredData.documentType = read.documentType;
+      dynamic = { fields: read.fields, documentTitle: read.documentTitle };
+      stored = docFields.assembleStructured({ known: structuredData, fields: dynamic.fields, documentTitle: dynamic.documentTitle, documentSummary: read.documentSummary });
+      // The text kept with the document (for search and "text found in the document") is the saved record, written out.
+      extractedText = [stored.documentTitle, stored.documentSummary, ...Object.entries(stored)
+        .filter(([k]) => !docFields.HIDDEN_KEYS.has(k) && !docFields.ALIAS_KEYS.has(k))
+        .map(([k, v]) => `${docFields.labelOf(k)}: ${v}`)].filter(Boolean).join('\n');
+    } else {
+      structuredData = await ocrService.extractWithAI(extractedText, ocrService.parseStructuredData(extractedText), aiService, owner);
+      // Whatever else the document prints (vehicle class, roll number, marks, account number...) is read too, using the
+      // page layout, and saved beside the usual fields in one clean shape. The profile below only takes the usual ones.
+      const TYPE_NAMES = { aadhaar: 'Aadhaar card', pan: 'PAN card', passport: 'Passport', license: 'Driving licence', voter: 'Voter ID' };
+      dynamic = await docFields.extractFields({
+        text: extractedText,
+        items: layoutItems,
+        known: structuredData,
+        aiService,
+        user: owner,
+        typeLabel: TYPE_NAMES[structuredData.documentType] || '',
+        fileName: named?.originalName || '',
+      }).catch((error) => { console.warn('Reading the other fields failed:', error.message); return { fields: {}, documentTitle: '' }; });
+      const assembled = docFields.assembleStructured({ known: structuredData, fields: dynamic.fields, documentTitle: dynamic.documentTitle });
+      const reviewed = await docFields.reviewWithAI({ text: extractedText, record: assembled, aiService, user: owner }).catch(() => ({ record: assembled }));
+      stored = reviewed.record;
+    }
 
     if (structuredData.address) {
       const formAnalyzerService = require('../services/formAnalyzerService');
       const addressComponents = formAnalyzerService.parseAddress(structuredData.address);
-      Object.assign(structuredData, addressComponents);
+      // Only the pieces the app really uses; the many alias spellings of the same pieces are not stored.
+      const pieces = Object.fromEntries(['city', 'district'].filter((k) => addressComponents[k]).map((k) => [k, addressComponents[k]]));
+      Object.assign(structuredData, pieces);
+      Object.assign(stored, Object.fromEntries(Object.entries(pieces).filter(([k]) => !(k in stored))));
     }
 
-    // Whatever else the document prints (vehicle class, roll number, marks, account number...) is read too, using the
-    // page layout, and saved beside the usual fields in one clean shape. The profile below only takes the usual ones.
-    const TYPE_NAMES = { aadhaar: 'Aadhaar card', pan: 'PAN card', passport: 'Passport', license: 'Driving licence', voter: 'Voter ID' };
-    const named = await Document.findById(documentId).select('originalName').lean();
-    const dynamic = await docFields.extractFields({
-      text: extractedText,
-      items: layoutItems,
-      known: structuredData,
-      aiService: require('../services/aiService'),
-      user: owner,
-      typeLabel: TYPE_NAMES[structuredData.documentType] || '',
-      fileName: named?.originalName || '',
-    }).catch((error) => { console.warn('Reading the other fields failed:', error.message); return { fields: {}, documentTitle: '' }; });
-    // The AI reviews the whole record against the document's own text before it is saved (never for encrypted accounts).
-    const assembled = docFields.assembleStructured({ known: structuredData, fields: dynamic.fields, documentTitle: dynamic.documentTitle });
-    const reviewed = await docFields.reviewWithAI({ text: extractedText, record: assembled, aiService: require('../services/aiService'), user: owner }).catch(() => ({ record: assembled }));
-    const stored = reviewed.record;
+    // The kind of document, kept on the document itself: it is what the app counts for "Your ID cards". The reader's answer
+    // wins; when it said nothing, the scored guess from the text (which copes with noisy photos) is used if it is sure.
+    const kindFromText = docKind.kindFromOcrText(extractedText);
+    const finalKind = ['aadhaar', 'pan', 'passport', 'license'].includes(structuredData.documentType) ? structuredData.documentType
+      : (!read && kindFromText && TOP_LEVEL_TYPES.has(kindFromText.key) ? kindFromText.key : null);
+    if (finalKind && !stored.documentType) stored.documentType = finalKind;
 
     await Document.findByIdAndUpdate(documentId, {
       extractedText,
       structuredData: stored,
       fieldsExtractedAt: new Date(),
-      ...(['aadhaar', 'pan', 'passport', 'license'].includes(structuredData.documentType) ? { documentType: structuredData.documentType } : {}),
+      ...(finalKind ? { documentType: finalKind } : {}),
+      thumbnail: await makeThumbnail(fileBuffer, named?.mimeType),
+      ...(read ? { aiReadAt: new Date() } : {}),
       ocrStatus: 'completed',
     });
 
+    if (updateProfile && !named?.migratedFrom) {
     const user = await User.findById(userId);
     // The profile (used to fill forms) takes the usual fields only, never one document's own extras like a roll number.
     const { documentType: _kind, ...profileFields } = docFields.assembleStructured({ known: structuredData, fields: Object.fromEntries(Object.entries(dynamic.fields).filter(([k]) => docFields.KNOWN_KEYS.includes(k))) });
@@ -351,6 +414,7 @@ async function processOCR(documentId, filePathOrKey, userId, useS3 = false) {
       ...profileFields,
     };
     await user.save();
+    }
 
     if (tempFilePath) {
       await fs.unlink(tempFilePath).catch(console.error);

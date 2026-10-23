@@ -144,25 +144,7 @@ async function resolveDoc(ctx, ref) {
 const fieldsText = (fields, reveal) => Object.keys(FIELD_LABEL).filter((k) => fields[k]).map((k) => `${FIELD_LABEL[k]}: ${show(k, fields[k], reveal)}`);
 
 // ---- answering only what was asked -------------------------------------------------------------------------------
-// Documents saved before their own labelled fields were read get them now, once, from the text already stored.
-async function backfillFields(rows, user) {
-  const todo = rows.filter((d) => !d.fieldsExtractedAt && d.extractedText && d.extractedText.length > 20).slice(0, 3);
-  await Promise.all(todo.map(async (d) => {
-    try {
-      const known = d.structuredData || {};
-      const read = await Promise.race([
-        docFields.extractFields({ text: d.extractedText, known, aiService, user, typeLabel: TYPE_LABEL[known.documentType] || '', fileName: d.originalName }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('timed out')), 25000)),
-      ]);
-      const assembled = docFields.assembleStructured({ known, fields: read.fields, documentTitle: known.documentTitle || read.documentTitle });
-      const stored = (await docFields.reviewWithAI({ text: d.extractedText, record: assembled, aiService, user })).record;
-      d.structuredData = stored;
-      await Document.updateOne({ _id: d._id }, { $set: { structuredData: stored, fieldsExtractedAt: new Date() } });
-    } catch (error) {
-      console.warn(`[whatsapp] could not read the fields of an older document: ${error.message}`);
-    }
-  }));
-}
+// Answers only ever use what was extracted and saved when the document was uploaded. Nothing is read or extracted again here.
 
 // The member's profile first, then what was read from their documents: every field of each, not a fixed list.
 async function profileAndDocs(ctx) {
@@ -172,7 +154,6 @@ async function profileAndDocs(ctx) {
   }
   const u = await User.findById(ctx.user._id).lean();
   const rows = await Document.find({ userId: ctx.user._id, securityVersion: { $ne: 2 }, ocrStatus: 'completed' }).sort({ uploadedAt: -1 }).limit(8).select('originalName documentType structuredData extractedText fieldsExtractedAt').lean();
-  await backfillFields(rows, ctx.user);
   return {
     profile: { fullName: u.name, email: u.email, phone: u.phone, ...(u.extractedData || {}) },
     docs: rows.map((d) => ({ name: d.originalName, title: d.structuredData?.documentTitle || '', type: d.structuredData?.documentType || d.documentType, fields: plain(d.structuredData) })),
@@ -249,6 +230,69 @@ async function answerFromTextSearch(ctx, question) {
   return matches.length ? docFields.formatMatches(matches, { reveal: Boolean(ctx.unlocked) }) : null;
 }
 
+
+// ---- answering from the member's saved documents --------------------------------------------------------------------
+// Standard accounts only. The AI is given the member's saved document records (what the AI reader saved: every field, table row
+// and figure) and answers ONLY from them. Aadhaar, PAN, passport and licence numbers are masked in what it sees, so it can never
+// repeat a full ID number; a request for the full number is handled by the PIN-checked tools. If the records do not hold the
+// answer it says so (NOTFOUND) and the caller decides what to say.
+const maskIds = (text) => String(text)
+  .replace(/\b\d{4}\s?\d{4}\s?\d{4}\b/g, (m) => `****${m.replace(/\s/g, '').slice(-4)}`)
+  .replace(/\b[A-Z]{5}\d{4}[A-Z]\b/g, (m) => `****${m.slice(-4)}`);
+
+async function recordsFor(ctx) {
+  const rows = await Document.find({ userId: ctx.user._id, securityVersion: { $ne: 2 }, ocrStatus: 'completed' })
+    .sort({ uploadedAt: -1 }).limit(25).select('originalName uploadedAt structuredData').lean();
+  let total = 0;
+  const blocks = [];
+  const profile = ctx.user.extractedData || {};
+  const profileLines = Object.keys(FIELD_LABEL).filter((k) => profile[k]).map((k) => `${FIELD_LABEL[k]}: ${SENSITIVE.has(k) ? `****${String(profile[k]).replace(/[^A-Za-z0-9]/g, '').slice(-4)}` : maskIds(String(profile[k]).slice(0, 300))}`);
+  if (ctx.user.name || profileLines.length) blocks.push(['Account profile (the person asking)', ctx.user.name ? `Account name: ${ctx.user.name}` : '', ...profileLines].filter(Boolean).join('\n'));
+  rows.forEach((d, i) => {
+    const sd = docFields.cleanKnown(d.structuredData || {});
+    const lines = Object.entries(sd)
+      .filter(([k, v]) => !docFields.HIDDEN_KEYS.has(k) && !docFields.ALIAS_KEYS.has(k) && v !== '' && v != null)
+      .map(([k, v]) => `${docFields.labelOf(k)}: ${SENSITIVE.has(k) ? `****${String(v).replace(/[^A-Za-z0-9]/g, '').slice(-4)}` : maskIds(String(v).slice(0, 400))}`);
+    const head = `Document ${i + 1}: ${sd.documentTitle || TYPE_LABEL[sd.documentType] || d.originalName} (file ${d.originalName}, added ${new Date(d.uploadedAt).toLocaleDateString('en-GB')})`;
+    const block = [head, sd.documentSummary ? `Summary: ${sd.documentSummary}` : '', ...lines].filter(Boolean).join('\n');
+    if (total + block.length > 40000) return;
+    total += block.length;
+    blocks.push(block);
+  });
+  return blocks;
+}
+
+async function answerGrounded(ctx, question) {
+  if (ctx.user.securityVersion === 2 || !aiService.isConfigured()) return null;
+  const blocks = await recordsFor(ctx);
+  if (!blocks.length) return null;
+  const system = `You answer a person's questions about their own documents on WhatsApp, using ONLY the records below.
+Start your reply with FOUND: when the records answer the question, or NOTFOUND: when they do not.
+Rules:
+- Every record below belongs to the person asking, whatever name is printed on it (a document can show a different spelling, or be the name of a family member they hold documents for). Never question whose it is.
+- Answer in one to three short lines of plain text. You may put a label in *asterisks*. No headings, no lists unless the person asked for a list.
+- Quote numbers, marks, dates and names exactly as the records show them. When a calculation is needed (an age, a sum), do it carefully and show the figure. Today is ${new Date().toLocaleDateString('en-GB')}.
+- Never use outside knowledge about the person. If the answer is not in the records, say NOTFOUND: and name the kind of document that would have it.
+- ID numbers appear masked (like ****1234). Keep them masked, and tell the person to reply *full* if they want the whole number.
+- If several documents could answer and they disagree, use the newest and say which document it is from.
+- Questions about how to do something (apply for a card, fill a form) are NOT answered from the records: reply NOTFOUND:.`;
+  try {
+    const reply = await aiService.chat(system, `RECORDS:\n\n${blocks.join('\n\n')}\n\nQUESTION: ${String(question).slice(0, 400)}\n\nANSWER:`, {
+      user: { securityVersion: 1, _id: ctx.user._id },
+      operation: aiService.AI_OPERATION.RAG,
+      primaryTimeout: 30000,
+    });
+    const text = String(reply || '').trim();
+    const found = /^FOUND:/i.test(text);
+    const body = text.replace(/^(FOUND|NOTFOUND):\s*/i, '').trim();
+    if (!body) return null;
+    return { found, text: found ? body.slice(0, 1500) : body.slice(0, 600) };
+  } catch (error) {
+    console.warn(`[whatsapp] the grounded answer failed: ${error.message}`);
+    return null;
+  }
+}
+
 const NOT_FOUND = 'I could not find that in your documents. Say *documents* to see what I have, or send me the document that has it.';
 
 // Answers a question by finding the fields it asks about, in any of the member's documents, and returns only those.
@@ -319,7 +363,18 @@ const TOOLS = {
       const docType = documentDetailsFor(ctx.text);
       if (docType) return TOOLS.get_document_details.run(ctx, { document: docType });
       const asked = limitTo(ctx.text) || limitTo(q);
-      if (asked) return { text: await answerRequested(ctx, asked, requestedFields(ctx.text).doc || requestedFields(q).doc) };
+      // ID numbers (Aadhaar, PAN ...) are shown masked unless the member confirmed their PIN: that stays in code. Encrypted accounts
+      // keep this path too. Every other question on a standard account is answered from the saved document records below.
+      if (asked && (ctx.user.securityVersion === 2 || asked.some((k) => SENSITIVE.has(k)))) return { text: await answerRequested(ctx, asked, requestedFields(ctx.text).doc || requestedFields(q).doc) };
+      // Standard accounts: the AI answers from the saved document records (see answerGrounded). The field matching below stays
+      // as the fallback for when the AI cannot be reached.
+      if (!wantsEverything(ctx.text) && !wantsEverything(q) && ctx.user.securityVersion !== 2) {
+        const grounded = await answerGrounded(ctx, ctx.text || q);
+        if (grounded?.found) return { text: grounded.text };
+        // Only when the AI could not be reached at all does the older field matching answer (it matches on single words).
+        if (!grounded && asked) return { text: await answerRequested(ctx, asked, requestedFields(ctx.text).doc || requestedFields(q).doc) };
+        if (grounded) return { text: `${grounded.text}\n\nIf it is in a document you have not sent yet, send me a photo or PDF of it.` };
+      }
       // Anything else specific (vehicle class, roll number, marks, account number...) is looked up in the documents' own
       // fields, whatever they are. Only a request for everything shows everything.
       if (!wantsEverything(ctx.text) && !wantsEverything(q)) {
@@ -720,6 +775,12 @@ async function run(ctx) {
     // No tool needed. If the text contains a clear save request the model missed, still save it.
     const found = /^(save|store|update|set)\b/i.test(ctx.text) ? parseSaveStatements(ctx.text) : null;
     if (found) { try { apply(await TOOLS.update_profile.run(ctx, { fields: found }), 'update_profile'); return result; } catch (e) { if (e instanceof PinRequired) { result.needsPin = true; return result; } throw e; } }
+    // The planner picked no tool. A question about the member's own documents is still answered from them, so it never ends in
+    // a general "I can't check that" when the answer is in a saved document.
+    if (ctx.user.securityVersion !== 2 && (/\?\s*$/.test(ctx.text) || /^(what|when|how|which|who|where|did|do|does|is|are|was|were|can|tell|show|give|list)\b/i.test(ctx.text))) {
+      const grounded = await answerGrounded(ctx, ctx.text);
+      if (grounded?.found) { result.texts.push(grounded.text); result.used.push('answer_from_my_data'); return result; }
+    }
     result.texts.push(String(plan.content || '').trim() || 'I am not sure what you would like to do. Say *help* to see what I can do.');
     return result;
   }
@@ -747,4 +808,4 @@ async function executeDelete(ctx, pending) {
   return { text: `Deleted *${pending.name}*.` };
 }
 
-module.exports = { run, executeDelete, parseSaveStatements, cleanFields, impliedCall, TOOLS, toolDefs, PinRequired, resolveDoc };
+module.exports = { answerGrounded, recordsFor, run, executeDelete, parseSaveStatements, cleanFields, impliedCall, TOOLS, toolDefs, PinRequired, resolveDoc };

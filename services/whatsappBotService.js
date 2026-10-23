@@ -7,6 +7,7 @@ const docKind = require('./whatsappDocKind');
 const ragService = require('./ragService');
 const aiService = require('./aiService');
 const { savePlainDocument } = require('../controllers/documentController');
+const { buildPreview } = require('./documentPreview');
 const { evaluateEligibility, ageFrom } = require('../controllers/eligibilityController');
 const { openVault, encryptPayload, encryptFileEnvelope } = require('./vaultCrypto');
 const agent = require('./whatsappAgent');
@@ -476,8 +477,12 @@ async function describeUpload(documentId, reveal = false, userId = null) {
   if (!doc || doc.ocrStatus === 'failed') return `I saved the file, and you can ask me to send it back, but I could not read any text from it. A clearer photo or a PDF usually works better.${ask(null)}`;
   if (doc.ocrStatus !== 'completed') return `I saved the file and I am still reading it. Ask "documents" in a minute to see it.${ask(null)}`;
 
-  const d = doc.structuredData || {};
-  const guess = docKind.guessKind({ documentType: d.documentType !== 'other' ? d.documentType : doc.documentType, documentTitle: d.documentTitle, text: doc.extractedText });
+  const d = docFields.cleanKnown(doc.structuredData || {});
+  // The AI already named and summarised the document when it was read: that is what the member is told. The question below
+  // only asks them to correct it when the AI could not tell what it was.
+  const preview = buildPreview(doc);
+  const sure = preview.kind !== 'other' || Boolean(d.documentTitle);
+  const guess = sure ? { key: preview.kind, label: d.documentTitle || preview.kindLabel } : null;
   const rows = [
     ['Type', guess ? guess.label : (TYPE_LABEL[d.documentType] || TYPE_LABEL[doc.documentType])],
     ['Name', d.fullName], ['Date of birth', d.dateOfBirth], ['Gender', d.gender],
@@ -485,7 +490,9 @@ async function describeUpload(documentId, reveal = false, userId = null) {
     ['Address', d.address],
   ].filter(([, v]) => v);
   if (!rows.length) return `I saved the file, but could not find any details in it. A clearer photo or a PDF usually works better.${ask(guess)}`;
-  return `Saved${guess ? ` as a *${guess.label}*` : ''}. Here is what I read:\n\n${rows.map(([k, v]) => `*${k}*: ${v}`).join('\n')}\n\nIf a detail is wrong, you can correct it in the app under Documents.${ask(guess)}`;
+  const extras = preview.facts.map((f) => [f.label, f.value]);
+  const tail = sure ? '' : ask(guess);
+  return `Saved${guess ? ` as *${guess.label}*` : ''}.${d.documentSummary ? `\n${d.documentSummary}` : ''}\n\n${[...rows, ...extras].map(([k, v]) => `*${k}*: ${v}`).join('\n')}\n\nEverything on it is saved, so you can ask me anything about it. If a detail is wrong, you can correct it in the app under Documents.${tail}`;
 }
 
 async function listDocuments(user) {
@@ -636,7 +643,7 @@ async function handleIncoming(msg, wa) {
           await askForPin(msg, user, 'save my file', file);
           return;
         }
-        await msg.reply(clip(await withProgress(msg, () => saveEncryptedMedia(msg, user, entry, file))));
+        await msg.reply(clip(`${await withProgress(msg, () => saveEncryptedMedia(msg, user, entry, file))}\n\n_Security V2 has been retired. To have the AI read your documents and answer questions about them, open FormOS > Settings and choose *Move to standard storage*._`));
         stats.answered += 1; stats.lastAnsweredAt = Date.now();
         return;
       }

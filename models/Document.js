@@ -26,6 +26,19 @@ const documentSchema = new mongoose.Schema({
     type: String,
     required: true
   },
+  // For a standard copy made when an account moved off Security V2: the encrypted original it was made from.
+  migratedFrom: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Document'
+  },
+  // When the AI read this document and its data was saved. Documents without it were saved by the older reader.
+  aiReadAt: {
+    type: Date
+  },
+  // A small picture of a photo or scan (data URL), so lists can show what the document looks like. Standard documents only.
+  thumbnail: {
+    type: String
+  },
   documentType: {
     type: String,
     enum: ['aadhaar', 'pan', 'passport', 'license', 'other'],

@@ -11,7 +11,7 @@
 const KNOWN_KEYS = ['fullName', 'fatherName', 'dateOfBirth', 'gender', 'aadhaarNumber', 'panNumber', 'passportNumber', 'drivingLicenseNumber', 'address', 'pincode', 'state', 'phone', 'email'];
 
 // Housekeeping stored with a document: not details printed on it.
-const HIDDEN_KEYS = new Set(['documentType', 'documentName', 'originalName', 'fileSize', 'securityLevel', 'yearOfBirth', 'mimeType', 'documentTitle', 'customFields']);
+const HIDDEN_KEYS = new Set(['documentType', 'documentSummary', 'documentName', 'originalName', 'fileSize', 'securityLevel', 'yearOfBirth', 'mimeType', 'documentTitle', 'customFields']);
 
 // Address pieces and duplicate names the address parser adds. They repeat what address/pincode already say.
 const ALIAS_KEYS = new Set(['zip', 'zipCode', 'postalCode', 'addressLine1', 'addressLine2', 'streetAddress', 'street']);
@@ -981,7 +981,7 @@ async function pickFieldsWithAI(question, docs, aiService, user) {
 
 // Everything that gets saved for a document, in one shape: the usual fields (already validated by the OCR reader) first,
 // then whatever else the document prints, then the title. Nothing outside this shape is stored.
-function assembleStructured({ known = {}, fields = {}, documentTitle = '' }) {
+function assembleStructured({ known = {}, fields = {}, documentTitle = '', documentSummary = '' }) {
   const out = {};
   const keep = (key, value) => { if (value !== undefined && value !== null && String(value).trim() !== '' && typeof value !== 'object') out[key] = typeof value === 'string' ? value.trim() : value; };
   if (known.documentType) keep('documentType', known.documentType);
@@ -997,6 +997,7 @@ function assembleStructured({ known = {}, fields = {}, documentTitle = '' }) {
   const extra = cleanFields(Object.fromEntries(Object.entries(fields).filter(([k]) => !KNOWN_KEYS.includes(k) && !(k in out))));
   for (const [key, value] of Object.entries(extra)) keep(key, value);
   if (documentTitle) keep('documentTitle', String(documentTitle).slice(0, 80));
+  if (documentSummary) keep('documentSummary', String(documentSummary).slice(0, 240));
   return out;
 }
 

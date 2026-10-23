@@ -172,6 +172,22 @@ class AIService {
     );
   }
 
+  // One request to a model that can see: `messages` may hold image and file parts. OpenRouter only, and standard accounts only
+  // (the same policy guard as every other call). Returns the model's text. Throws when the model cannot answer.
+  async chatVision(messages, options = {}) {
+    const system = typeof messages[0]?.content === 'string' ? messages[0].content : '';
+    this.enforcePolicyGuard(system, '', options);
+    if (!this.openrouter) throw new Error('No vision provider is configured');
+    const model = options.model || process.env.AI_VISION_MODEL || 'openai/gpt-4o';
+    const body = { model, messages, temperature: 0, max_tokens: 12000, response_format: { type: 'json_object' } };
+    if (options.plugins) body.plugins = options.plugins;
+    const response = await this.openrouter.chat.completions.create(body, { timeout: options.timeout || 120000, maxRetries: 1 });
+    const message = response.choices?.[0]?.message;
+    const content = message?.content || (Array.isArray(message?.content) ? message.content.map((b) => b.text).join('') : '');
+    if (!content) throw new Error('The vision model returned nothing');
+    return content;
+  }
+
   enforcePolicyGuard(systemPrompt, userPrompt, options) {
     const user = options.user;
     const operation = options.operation;

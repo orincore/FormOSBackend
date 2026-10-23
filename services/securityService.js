@@ -9,6 +9,8 @@ const DEFAULT_TRUSTED_DEVICE_DAYS = parseInt(process.env.TRUSTED_DEVICE_DAYS || 
 const SENSITIVE_FIELDS = new Set([
   'aadhaarNumber',
   'panNumber',
+  'passportNumber',
+  'drivingLicenseNumber',
   'dateOfBirth',
   'phone',
   'email',
