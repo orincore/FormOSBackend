@@ -269,6 +269,9 @@ function parseCorrection(text) {
   const lead = "(?:no[,.]?\\s+|actually[,.]?\\s+)?";
   let m = t.match(new RegExp(`^${lead}(?:it'?s|it is|its|should be|is|make it)\\s+(\\S.*?)\\s*,?\\s+(?:and\\s+)?(?:not|instead of|rather than)\\s+(\\S.*?)(?:\\s*,?\\s*(?:please\\s+)?(?:correct|fix|change|update)(?:\\s+(?:it|that))?)?\\s*[.!]*$`, 'i'));
   if (m) return { nu: m[1].trim(), old: m[2].trim() };
+  // "update my address its not shami its shanti": the detail is named, then what is wrong and what it should be.
+  m = t.match(/^(?:please\s+)?(?:update|change|correct|fix)\s+(?:my\s+)?[a-z ]{2,30}?[,:]?\s+(?:it'?s|its|it is)\s+not\s+(\S.*?)\s*[,;]?\s+(?:it'?s|its|it is|but)\s+(\S.*?)\s*[.!]*$/i);
+  if (m) return { nu: m[2].trim(), old: m[1].trim() };
   m = t.match(/\b(?:the\s+)?(?:last|ending)\s+(?:\d+\s+)?(?:digits?|numbers?|characters?)\s+(?:is|are|should be|=)\s+(\S+)/i);
   if (m) return { nu: m[1].trim(), tail: true };
   m = t.match(new RegExp(`^${lead}(?:(?:please\\s+)?(?:correct|fix|change|update)\\s+(?:it|that|this)\\s+(?:to|as|with)|it'?s|it is|its|should be|make it)\\s+(\\S.*?)\\s*[.!]*$`, 'i'));
@@ -278,6 +281,19 @@ function parseCorrection(text) {
 
 // Puts `fresh` where `stale` is in `current`, at its last occurrence, keeping the number's spacing ("MH05 2022000041" stays grouped).
 function replaceFragment(current, stale, fresh) {
+  // Words (not numbers): swap the whole word wherever it last appears, keeping the capital letter and every space as they were.
+  if (/[A-Za-z]{3,}/.test(String(stale))) {
+    const escaped = String(stale).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(^|[^A-Za-z0-9])(${escaped})(?![A-Za-z0-9])`, 'gi');
+    let last = null; let hit;
+    while ((hit = re.exec(String(current))) !== null) last = hit;
+    if (last) {
+      const start = last.index + last[1].length;
+      const word = String(current).slice(start, start + String(stale).trim().length);
+      const fix = /^[A-Z]/.test(word) && /^[a-z]/.test(String(fresh)) ? String(fresh).charAt(0).toUpperCase() + String(fresh).slice(1) : String(fresh);
+      return String(current).slice(0, start) + fix + String(current).slice(start + word.length);
+    }
+  }
   const squash = (x) => String(x).replace(/[\s-]/g, '');
   const cur = squash(current); const o = squash(stale); const n = squash(fresh);
   const at = o ? cur.toUpperCase().lastIndexOf(o.toUpperCase()) : -1;
@@ -305,13 +321,14 @@ async function currentValue(ctx, key) {
 const syncDetail = (ctx, key, fresh) => myData.syncDetail(ctx.user._id, key, fresh);
 
 async function tryCorrection(ctx) {
-  const focus = focusOf(ctx);
-  if (!focus || ctx.user.securityVersion === 2) return null;
+  if (ctx.user.securityVersion === 2) return null;
   const fix = parseCorrection(ctx.text);
   if (!fix) return null;
 
   // Which detail: one the message names ("licence"), else the one just shown.
   const named = (requestedFields(ctx.text).keys || []).filter((k) => FIELD_LABEL[k]);
+  const focus = focusOf(ctx) || (named.length === 1 ? { keys: named, docType: null } : null);
+  if (!focus) return null;
   const keys = named.length ? named : focus.keys;
   if (keys.length !== 1) return { text: `Which one do you want to change: ${keys.map((k) => FIELD_LABEL[k].toLowerCase()).join(' or ')}? Tell me, for example "change my ${FIELD_LABEL[keys[0]].toLowerCase()} to ...".` };
   const key = keys[0];
@@ -485,8 +502,9 @@ const TOOLS = {
           Object.entries(extra).forEach(([k, v]) => { set[`extractedData.customFields.${k.replace(/\./g, ' ')}`] = v; });
           if (ok.phone) set.phone = ok.phone;
           await User.updateOne({ _id: ctx.user._id }, { $set: set });
-          // A document that holds this detail is changed with it, so answers read from the document agree with the profile.
-          for (const [k, v] of Object.entries(ok)) if (SENSITIVE.has(k)) await syncDetail(ctx, k, v);
+          // Every document that holds this detail (an address, a date of birth, a number) is changed with it, so an answer read from a
+          // document never contradicts what the member just said.
+          for (const [k, v] of Object.entries(ok)) await syncDetail(ctx, k, v);
           rememberFocus(ctx, Object.keys(ok));
         }
       }
@@ -498,6 +516,54 @@ const TOOLS = {
     },
   },
 
+  update_document_data: {
+    description: "Change any value that was read from one of the member's documents: a percentage, a score, a roll number, a date, a name on a certificate, anything shown in that document's details. Pass `field` (its label as the member says it, e.g. 'percentage', 'CIBIL score', 'roll number'), `value` (the new value) and, when they name one, `document`. For the standard details (address, phone, date of birth, ID numbers...) update_profile does the same on every document. Never invent a value.",
+    parameters: { type: 'object', properties: { field: { type: 'string' }, value: { type: 'string' }, document: { type: 'string', description: 'Which document, when the member says (a name, a type or its number in the list)' } }, required: ['field', 'value'] },
+    async run(ctx, { field, value, document }) {
+      const blocked = needsVault(ctx); if (blocked) return blocked;
+      if (ctx.user.securityVersion === 2) return { text: 'Your documents are still in the retired Security V2 storage, so I cannot change their details here. Open FormOS > Settings and choose *Move to standard storage* first.' };
+      const wanted = String(field || '').trim();
+      const fresh = String(value ?? '').trim();
+      if (!wanted || !fresh) return { text: 'Tell me which detail to change and its new value, for example "change my 12th percentage to 85".' };
+      const norm = (x) => String(x || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const w = norm(wanted).replace(/^(my|the)/, '');
+
+      // The standard details live in the profile and in every document that holds them: one change covers all.
+      const std = Object.keys(FIELD_LABEL).find((k) => norm(FIELD_LABEL[k]) === w || norm(k) === w);
+      if (std && !document) return TOOLS.update_profile.run(ctx, { fields: { [std]: fresh } });
+
+      // The member may name a document ("on my 12th marksheet"); if the name matches nothing the search simply covers every document.
+      let scope = null;
+      if (document) { const r = await resolveDoc(ctx, document); if (!r.error) scope = String(r.doc.id); }
+      const search = async (only) => {
+        const rows = await Document.find({ userId: ctx.user._id, securityVersion: { $ne: 2 }, ocrStatus: 'completed', ...(only ? { _id: only } : {}) }).sort({ uploadedAt: -1 });
+        const hits = [];
+        for (const row of rows) {
+          const sd = docFields.cleanKnown(row.structuredData || {});
+          const keys = Object.keys(sd).filter((k) => !docFields.HIDDEN_KEYS.has(k) && !docFields.ALIAS_KEYS.has(k) && typeof sd[k] === 'string');
+          const exact = keys.filter((k) => norm(docFields.labelOf(k)) === w || norm(k) === w);
+          const loose = exact.length ? exact : keys.filter((k) => w.length >= 3 && (norm(docFields.labelOf(k)).includes(w) || (w.includes(norm(docFields.labelOf(k))) && norm(docFields.labelOf(k)).length >= 4)));
+          if (loose.length === 1) hits.push({ row, key: loose[0], old: sd[loose[0]] });
+          else if (loose.length > 1) return { ambiguous: `More than one detail matches "${wanted}" on ${row.structuredData?.documentTitle || row.originalName}: ${loose.map((k) => docFields.labelOf(k)).join(', ')}. Tell me which one.` };
+        }
+        return { hits };
+      };
+      let result = await search(scope);
+      if (!result.ambiguous && !result.hits.length && scope) result = await search(null);
+      if (result.ambiguous) return { text: result.ambiguous };
+      const found = result.hits;
+      if (!found.length) return { text: `I could not find a detail called "${wanted}" in your documents. Say *details* to see what is saved.` };
+      if (found.length > 1) {
+        return { text: `More than one document has "${docFields.labelOf(found[0].key)}":\n${found.map((f, i) => `${i + 1}. ${f.row.structuredData?.documentTitle || f.row.originalName}: ${show(f.key, f.old, false)}`).join('\n')}\nTell me which one to change, for example "change it on ${(found[0].row.structuredData?.documentTitle || found[0].row.originalName)}".` };
+      }
+      const { row, key, old } = found[0];
+      if (SENSITIVE.has(key) || docFields.isSensitive(key, docFields.labelOf(key), old)) needsUnlock(ctx);
+      const r = await myData.setDocumentField(ctx.user._id, row._id, key, fresh);
+      if (r.error) return { text: r.error };
+      rememberFocus(ctx, FIELD_LABEL[key] ? [key] : []);
+      return { text: `Changed *${docFields.labelOf(key)}* on *${row.structuredData?.documentTitle || row.originalName}* to *${ctx.unlocked ? r.value : show(key, r.value, false)}*.` };
+    },
+  },
   list_documents: {
     description: "List the member's stored documents with a number for each.",
     parameters: { type: 'object', properties: {} },
@@ -743,6 +809,7 @@ How you work:
 - Answer ONLY what was asked. If the member asks for one detail (their address, date of birth, phone...), reply with just that detail, never their whole profile or other fields. Pass only the asked field names to get_profile. Show everything only when they clearly ask for all their details.
 - Act by calling tools. For anything about the member's own data or documents, always call a tool: never answer from memory or guess.
 - Saving data: call update_profile with the values the member gave. Normalise obvious formats but never invent values.
+- Changing a value that was read from a document (a percentage, a score, a roll number, a date on a certificate): call update_document_data with the field, the new value and the document if they name one.
 - Documents are saved when the member sends a photo or PDF, so you do not need a tool for that. If they ask how, tell them to send the file in this chat.
 - You can call several tools in one turn when a request has several parts.
 - Deleting: when the member asks to delete or remove a document, call delete_document. It only asks them to confirm; nothing is deleted until they say yes. Do not list documents instead.
