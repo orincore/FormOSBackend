@@ -264,7 +264,7 @@ const focusNote = (ctx) => {
 // ---- corrections: "it is 47 not 41", "change it to ..." ----------------------------------------------------------------
 // Understood in code, against what was just shown, so a short correction is applied exactly. The model is not involved.
 function parseCorrection(text) {
-  const t = String(text || '').trim();
+  const t = String(text || '').replace(/[\u2018\u2019\u02bc]/g, "'").trim();
   if (t.length > 140) return null;
   const lead = "(?:no[,.]?\\s+|actually[,.]?\\s+)?";
   let m = t.match(new RegExp(`^${lead}(?:it'?s|it is|its|should be|is|make it)\\s+(\\S.*?)\\s*,?\\s+(?:and\\s+)?(?:not|instead of|rather than)\\s+(\\S.*?)(?:\\s*,?\\s*(?:please\\s+)?(?:correct|fix|change|update)(?:\\s+(?:it|that))?)?\\s*[.!]*$`, 'i'));
@@ -326,7 +326,8 @@ async function tryCorrection(ctx) {
   if (!fix) return null;
 
   // Which detail: one the message names ("licence"), else the one just shown.
-  const named = (requestedFields(ctx.text).keys || []).filter((k) => FIELD_LABEL[k]);
+  // Words inside the new value ("... Badlapur west pincode: 421503") say nothing about which detail is being corrected.
+  const named = (requestedFields(String(ctx.text).replace(fix.nu, ' ')).keys || []).filter((k) => FIELD_LABEL[k]);
   const focus = focusOf(ctx) || (named.length === 1 ? { keys: named, docType: null } : null);
   if (!focus) return null;
   const keys = named.length ? named : focus.keys;
@@ -357,9 +358,21 @@ async function tryCorrection(ctx) {
   if (checked.error) return { text: `I did not change anything: ${FIELD_LABEL[key]}, ${checked.error}.` };
   if (checked.value.replace(/\s/g, '') === current.replace(/\s/g, '')) return { text: `Your ${FIELD_LABEL[key].toLowerCase()} is already ${show(key, current, ctx.unlocked)}.` };
 
-  const docs = await syncDetail(ctx, key, checked.value);
+  let finalValue = checked.value;
+  let pinNote = '';
+  if (key === 'address') {
+    // "... Badlapur west pincode: 421503": the pincode is kept as its own detail, and the address keeps it the way it was stored.
+    const pin = finalValue.match(/\b(?:pin\s*code|pincode|pin)\s*[:\-]?\s*(\d{6})\b/i) || finalValue.match(/[,\s](\d{6})\s*$/);
+    if (pin) {
+      const rest = finalValue.replace(pin[0], '').replace(/[,\s:\-]+$/, '').trim();
+      finalValue = `${rest}, PIN code ${pin[1]}`;
+      await syncDetail(ctx, 'pincode', pin[1]);
+      pinNote = ` and your PIN code to ${pin[1]}`;
+    }
+  }
+  const docs = await syncDetail(ctx, key, finalValue);
   rememberFocus(ctx, [key], focus.docType);
-  return { text: `Done. I changed your ${FIELD_LABEL[key].toLowerCase()} to *${show(key, checked.value, ctx.unlocked)}*${docs ? ` on your profile and ${docs} document${docs === 1 ? '' : 's'}` : ' on your profile'}.` };
+  return { text: `Done. I changed your ${FIELD_LABEL[key].toLowerCase()} to *${show(key, finalValue, ctx.unlocked)}*${pinNote}${docs ? ` on your profile and ${docs} document${docs === 1 ? '' : 's'}` : ' on your profile'}.` };
 }
 
 // ---- a job waiting for the resume ----------------------------------------------------------------------------------------------
@@ -415,7 +428,12 @@ const TOOLS = {
       // as the fallback for when the AI cannot be reached.
       if (!wantsEverything(ctx.text) && !wantsEverything(q) && ctx.user.securityVersion !== 2) {
         const grounded = await answerGrounded(ctx, ctx.text || q);
-        if (grounded?.found) return { text: grounded.text };
+        if (grounded?.found) {
+          // What was just answered is what a short follow-up ("no, it's ...") is about.
+          const shown = (asked || requestedFields(ctx.text).keys || []).filter((k) => FIELD_LABEL[k]);
+          if (shown.length) rememberFocus(ctx, shown);
+          return { text: grounded.text };
+        }
         // Only when the AI could not be reached at all does the older field matching answer (it matches on single words).
         if (!grounded && asked) return { text: await answerRequested(ctx, asked, requestedFields(ctx.text).doc || requestedFields(q).doc) };
         if (grounded) return { text: `${grounded.text}\n\nIf it is in a document you have not sent yet, send me a photo or PDF of it.` };
@@ -909,6 +927,8 @@ async function runTool(name, args, ctx) {
 
 // ctx: { user, text, history, unlocked, entry, deps }. Returns { texts, files, needsPin, used }.
 async function run(ctx) {
+  // Phones type curly quotes (it\u2019s): every rule below reads them as the plain ones.
+  ctx = { ...ctx, text: String(ctx.text || '').replace(/[\u2018\u2019\u02bc]/g, "'").replace(/[\u201c\u201d]/g, '"') };
   const result = { texts: [], files: [], needsPin: false, used: [] };
   const apply = (out, name) => { if (!out) return; if (out.text) result.texts.push(out.text); if (out.files) result.files.push(...out.files); if (name) result.used.push(name); };
 

@@ -49,7 +49,7 @@ function cleanField(key, raw) {
       const p = v.toUpperCase().replace(/\s+/g, ' ').trim();
       return docFields.valueFitsKey('drivingLicenseNumber', p) ? { value: p } : { error: 'a licence number has letters and digits, for example MH05 20220000041' };
     }
-    case 'address': return v.length >= 6 && v.length <= 300 ? { value: v.replace(/\s+/g, ' ') } : { error: 'the address should be 6 to 300 characters' };
+    case 'address': { const a = v.replace(/^(?:no[,.]?\s+)?(?:actually[,.]?\s+)?(?:it'?s|it\u2019s|it is|its|my address is)\s+/i, ''); return a.length >= 6 && a.length <= 300 ? { value: a.replace(/\s+/g, ' ') } : { error: 'the address should be 6 to 300 characters' }; }
     case 'pincode': return /^[1-9]\d{5}$/.test(v) ? { value: v } : { error: 'a PIN code has 6 digits' };
     case 'state': return STATES.test(v) ? { value: v } : { error: 'that does not look like a state' };
     case 'phone': {
