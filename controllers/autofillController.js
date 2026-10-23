@@ -1,31 +1,14 @@
 const User = require('../models/User');
 const Document = require('../models/Document');
 const { HIDDEN_KEYS, labelOf, isSensitive } = require('../services/documentFields');
+const aiService = require('../services/aiService');
+const smartFill = require('../services/smartFill');
 
-exports.getAutofillData = async (req, res) => {
-  try {
-    const user = await User.findById(req.userId);
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found',
-      });
-    }
-
-    const includeSensitive = String(req.query.includeSensitive || '').toLowerCase() === 'true';
-
-    if (includeSensitive && !req.stepUpVerified) {
-      return res.status(403).json({
-        success: false,
-        code: 'STEP_UP_REQUIRED',
-        message: 'Recent re-authentication is required before sensitive autofill.',
-      });
-    }
-
+// Gathers everything the member's documents say, in the shapes the extension fills from. Shared by the plain autofill and the smart fill.
+async function loadAutofill(user, includeSensitive) {
     // Query all documents associated with user to aggregate extracted information
     // Newest first, so when two documents disagree the more recent one wins.
-    const docs = await Document.find({ userId: req.userId }).sort({ createdAt: -1 });
+    const docs = await Document.find({ userId: user._id }).sort({ createdAt: -1 });
 
     const aggregated = {};
     for (const doc of docs) {
@@ -187,6 +170,32 @@ exports.getAutofillData = async (req, res) => {
       };
     }
 
+    return { payload, fullAutofillData, fields };
+}
+
+exports.getAutofillData = async (req, res) => {
+  try {
+    const user = await User.findById(req.userId);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found',
+      });
+    }
+
+    const includeSensitive = String(req.query.includeSensitive || '').toLowerCase() === 'true';
+
+    if (includeSensitive && !req.stepUpVerified) {
+      return res.status(403).json({
+        success: false,
+        code: 'STEP_UP_REQUIRED',
+        message: 'Recent re-authentication is required before sensitive autofill.',
+      });
+    }
+
+    const { payload } = await loadAutofill(user, includeSensitive);
+
     return res.json({
       success: true,
       ...payload,
@@ -198,5 +207,35 @@ exports.getAutofillData = async (req, res) => {
       success: false,
       message: 'Error fetching autofill data',
     });
+  }
+};
+
+exports.loadAutofill = loadAutofill;
+
+// POST /api/autofill/smart: the AI matches a page's fields to the member's facts. Only labels go to the AI, never values.
+exports.smartFill = async (req, res) => {
+  try {
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const includeSensitive = req.body?.includeSensitive === true;
+    if (includeSensitive && !req.stepUpVerified) {
+      return res.status(403).json({ success: false, code: 'STEP_UP_REQUIRED', message: 'Recent re-authentication is required before sensitive autofill.' });
+    }
+    // Encrypted (Security V2) accounts have nothing readable on the server, and their details never go near a cloud AI.
+    if (user.securityVersion === 2) return res.status(409).json({ success: false, code: 'AI_NOT_AVAILABLE', message: 'Smart fill is not available for encrypted accounts.' });
+    if (!aiService.isConfigured()) return res.status(503).json({ success: false, code: 'AI_NOT_AVAILABLE', message: 'AI service is not configured.' });
+
+    const descriptors = req.body?.fields;
+    if (!Array.isArray(descriptors) || descriptors.length === 0) return res.status(400).json({ success: false, message: 'No form fields were sent.' });
+
+    // The full data is read here so the plan knows which locked facts really exist; values of locked ones are not returned.
+    const { fullAutofillData, fields } = await loadAutofill(user, true);
+    const { plan, asked } = await smartFill.planFill({ descriptors, data: fullAutofillData, fields, includeSensitive, isSensitive, user });
+    return res.json({ success: true, plan, asked, locked: plan.filter((p) => p.locked).length });
+  } catch (error) {
+    if (error.code === 'BAD_AI_ANSWER') return res.status(502).json({ success: false, code: 'AI_NOT_AVAILABLE', message: error.message });
+    console.error('Smart fill error:', error.message);
+    return res.status(502).json({ success: false, code: 'AI_NOT_AVAILABLE', message: 'Smart fill could not run right now.' });
   }
 };
