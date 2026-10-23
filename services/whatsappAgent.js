@@ -5,7 +5,7 @@ const StorageService = require('./storageService');
 const { decryptPayload, encryptPayload, decryptFileEnvelope } = require('./vaultCrypto');
 const User = require('../models/User');
 const Document = require('../models/Document');
-const { evaluateEligibility, looksLikeJob } = require('../controllers/eligibilityController');
+const { evaluateEligibility, looksLikeJob, aiLooksLikeJob } = require('../controllers/eligibilityController');
 const { requestedFields, limitTo, documentDetailsFor, wantsEverything, DOC_WORDS } = require('./whatsappFields');
 const docFields = require('./documentFields');
 const docKind = require('./whatsappDocKind');
@@ -862,7 +862,7 @@ async function run(ctx) {
   }
 
   // A pasted job description is checked against the resume (or the member is asked for one), whatever tool the model would pick.
-  if (ctx.user.securityVersion !== 2 && String(ctx.text).length >= 140 && looksLikeJob(ctx.text)) {
+  if (ctx.user.securityVersion !== 2 && String(ctx.text).length >= 140 && (looksLikeJob(ctx.text) || (String(ctx.text).length >= 400 && await aiLooksLikeJob(ctx.user, ctx.text)))) {
     apply(await TOOLS.check_eligibility.run(ctx, { requirements: ctx.text }), 'check_eligibility');
     return result;
   }

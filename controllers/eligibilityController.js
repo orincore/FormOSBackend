@@ -109,10 +109,28 @@ Do not assume the candidate holds any document, qualification, job, address or a
 
 // Is this the description of a job (not a scheme, loan or scholarship)? A job is judged against a resume, so one is needed first.
 const JOB_WORDS = /\b(job|jobs|role|position|vacanc(?:y|ies)|opening|hiring|recruit\w*|employment|employer|full[- ]?time|part[- ]?time|internship|intern|fresher|work experience|years? of experience|\d+\+?\s*(?:years?|yrs?)|responsibilit\w+|skills?|qualifications?|salary|ctc|lpa|engineer|developer|manager|analyst|designer|executive|consultant|architect|administrator|associate|officer|assistant|programmer|tester|devops|backend|frontend|full[- ]?stack)\b/gi;
+// A job posting is built the same way everywhere: a role, a summary, responsibilities, qualifications, skills. Recognising that
+// structure (several of its headings) is stronger than counting keywords.
+const JD_HEADINGS = /\b(job description|job summary|role summary|key responsibilities|responsibilities|required qualifications?|preferred qualifications?|minimum qualifications?|qualifications|requirements|technical skills|skills required|about the (?:role|job|position)|what you(?:'|\u2019)ll (?:do|bring|need)|who you are|years? of experience|equal opportunity|we are (?:seeking|looking|hiring)|apply (?:now|today)|job type|employment type|work location|notice period|ctc|salary range)\b/gi;
+
 function looksLikeJob(text) {
-  const hits = new Set((String(text || '').match(JOB_WORDS) || []).map((w) => w.toLowerCase()));
-  const other = /\b(scholarship|scheme|yojana|subsidy|loan|visa|pension|housing|grant|fellowship)\b/i.test(text);
-  return other ? hits.size >= 5 : hits.size >= 2;
+  const t = String(text || '');
+  const hits = new Set((t.match(JOB_WORDS) || []).map((w) => w.toLowerCase()));
+  const headings = new Set((t.match(JD_HEADINGS) || []).map((w) => w.toLowerCase()));
+  const other = /\b(scholarship|scheme|yojana|subsidy|loan|visa|pension|housing|grant|fellowship)\b/i.test(t);
+  if (other) return hits.size >= 5;
+  if (headings.size >= 3 && hits.size >= 1) return true; // laid out like a posting
+  return hits.size >= 2;
+}
+
+// For a long message the rules cannot settle, a cheap AI check says whether it is a job posting. Used only for long text.
+async function aiLooksLikeJob(user, text) {
+  try {
+    const reply = await aiService.chat('You decide whether a message is a job posting or job description (a role with duties, qualifications or skills an employer wants). Answer with exactly one word: JOB or NOT_JOB.', String(text).slice(0, 2500), {
+      user: { securityVersion: 1, _id: user?._id }, operation: aiService.AI_OPERATION.CLASSIFICATION, primaryTimeout: 15000,
+    });
+    return /^\s*JOB\b/i.test(String(reply || ''));
+  } catch { return false; }
 }
 
 const NEEDS_RESUME = {
@@ -199,6 +217,7 @@ JSON:`;
 
 exports.evaluateEligibility = evaluateEligibility;
 exports.looksLikeJob = looksLikeJob;
+exports.aiLooksLikeJob = aiLooksLikeJob;
 exports.NEEDS_RESUME = NEEDS_RESUME;
 exports.ageFrom = ageFrom;
 

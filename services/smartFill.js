@@ -13,7 +13,7 @@ const BATCH = 10;
 
 // The usual details, named the way the extension names them. `locked` ones need the sensitive-access step-up.
 const STANDARD = [
-  ['fullName', 'Full name'], ['firstName', 'First name'], ['middleName', 'Middle name'], ['lastName', 'Last name (surname)'],
+  ['title', 'Title (Mr or Ms)'], ['fullName', 'Full name'], ['firstName', 'First name'], ['middleName', 'Middle name'], ['middleInitial', 'Middle initial (one letter)'], ['lastName', 'Last name (surname)'],
   ['fatherName', "Father's name"], ['email', 'Email address'], ['phone', 'Mobile number'], ['alternatePhone', 'Alternate mobile number'],
   ['dateOfBirth', 'Date of birth'], ['dobDay', 'Day of birth'], ['dobMonth', 'Month of birth'], ['dobYear', 'Year of birth'],
   ['age', 'Age in years'], ['gender', 'Gender'], ['nationality', 'Nationality'],
@@ -51,6 +51,10 @@ function buildFacts({ data, fields, includeSensitive, isSensitive }) {
     const age = ageFrom(dob);
     if (age !== null) derived.age = String(age);
   }
+  // Derived from details the member has: the title from their gender, the middle initial from their middle name.
+  const gender = clean(derived.gender).toLowerCase();
+  if (/^m/.test(gender)) derived.title = 'Mr'; else if (/^f/.test(gender)) derived.title = 'Ms';
+  if (clean(derived.middleName)) derived.middleInitial = clean(derived.middleName)[0].toUpperCase();
   for (const [key, label] of STANDARD) {
     const value = clean(derived[key]);
     if (!value) continue;
@@ -100,6 +104,7 @@ Rules:
 - A document number or detail in FACTS (roll number, percentage, class of vehicle ...) matches a field that asks for that same thing, even if the wording differs ("Marks obtained in %" is the percentage, "Candidate Roll No." is the roll number).
 - A dropdown or a group of choices: pick the fact that answers the question (gender, state, nationality, country, month of birth ...).
 - Leave out: search boxes, passwords, OTP or captcha, coupons, comments or messages, declarations and consent boxes, and details of other people (mother, spouse, nominee, referee, guardian) or of an organisation (employer, school, bank) unless a fact is for exactly that.
+- A home, mobile or cell phone box is the mobile number. A work, office, fax, bank or customer-service number is not. A birth place is a town: it is never a date or an address. A title or salutation is the title fact, an initial is the initial fact.
 - Never guess between two facts that mean different things. If a field is truly unclear, leave it out.`;
 
 function parseReply(reply) {
@@ -110,11 +115,25 @@ function parseReply(reply) {
 }
 
 // Cheap sanity checks on the AI's choice, so an obvious mistake is dropped and the field is left for the member.
+const STANDARD_KEYS = new Set(STANDARD.map(([k]) => k));
+// Words that mean a field is about something other than the member's own details (a company, a card, a bank, a fax line ...).
+const OTHER_THING = /\b(customer service|support|helpline|toll[- ]?free|fax|work|office|business|company|employer|bank|card|credit|debit|expir\w*|cvv|cvc|issuing|income|salary|web ?site|url|user ?id|password)\b/i;
+
 function fits(desc, key) {
   const type = desc.type;
-  // An "alternate", "secondary" or "emergency" contact box is not the member's own number or email: the same value would be a wrong answer.
   const wording = [desc.label, ...(desc.hints || [])].join(' ').toLowerCase();
+  const standard = STANDARD_KEYS.has(key);
+  // An "alternate", "secondary" or "emergency" contact box is not the member's own number or email: the same value would be a wrong answer.
   if (['phone', 'email'].includes(key) && /\b(alternate|alternative|secondary|emergency|other|second|office|work|parent|guardian|relative|spouse|friend)\b/.test(wording)) return false;
+  // A work, fax, bank or customer-service number, a card name, a company ... is not one of the member's own details.
+  if (standard && OTHER_THING.test(wording)) return false;
+  // A birth place is a town: never a date, an address or the town they live in.
+  if (standard && /birth ?place|place of birth|town of birth|city of birth|born (?:in|at)/.test(wording)) return false;
+  // A title or a salutation is Mr or Ms, and an initial is one letter: never a name.
+  if (/\b(title|salutation|honorific|prefix)\b/.test(wording) && key !== 'title') return false;
+  if (/\binitials?\b/.test(wording) && key !== 'middleInitial') return false;
+  if (key === 'title' && !/\b(title|salutation|honorific|prefix|mr)\b/.test(wording)) return false;
+  if (key === 'middleInitial' && !/\binitial/.test(wording)) return false;
   if (type === 'email' && key !== 'email') return false;
   if (type === 'tel' && !['phone', 'alternatePhone'].includes(key)) return false;
   if (type === 'date' && !['dateOfBirth'].includes(key) && !/date/i.test(key)) return false;
@@ -137,10 +156,16 @@ async function planFill({ descriptors, data, fields, includeSensitive, isSensiti
 
   // Small batches, asked in parallel: one call with a whole page makes the model skip fields it should match.
   const ask = async (batch, recheck = false) => {
-    const reply = await aiService.chat(recheck ? `${SYSTEM}\nThese fields were not matched on a first pass. Look at each again and match every one that asks for any of the FACTS; leave out only the ones that truly ask for nothing in FACTS.` : SYSTEM, `FACTS (key | meaning):\n${factLines}\n\nFORM FIELDS (one per line):\n${batch.map(line).join('\n')}\n\nJSON:`, {
+    // Matching a page's fields to the member's facts is judgement work: the stronger model does it (AI_FORM_MODEL to change it).
+    const reply = await aiService.chatVision([
+      { role: 'system', content: recheck ? `${SYSTEM}\nThese fields were not matched on a first pass. Look at each again and match every one that asks for any of the FACTS; leave out only the ones that truly ask for nothing in FACTS.` : SYSTEM },
+      { role: 'user', content: `FACTS (key | meaning):\n${factLines}\n\nFORM FIELDS (one per line):\n${batch.map(line).join('\n')}\n\nJSON:` },
+    ], {
       user: { securityVersion: 1, _id: user?._id },
       operation: aiService.AI_OPERATION.CLASSIFICATION,
-      primaryTimeout: 30000,
+      model: process.env.AI_FORM_MODEL || process.env.AI_ANSWER_MODEL || 'openai/gpt-4o',
+      maxTokens: 1500,
+      timeout: 45000,
     });
     const parsed = parseReply(reply);
     if (!parsed || !Array.isArray(parsed.matches)) throw Object.assign(new Error('The AI answer could not be read.'), { code: 'BAD_AI_ANSWER' });

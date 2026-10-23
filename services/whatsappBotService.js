@@ -106,7 +106,14 @@ const lastQuestion = new Map(); // userId -> { text, at }, so a bare "full" know
 
 const FULL_WORD = /\b(full|complete|entire|unmask\w*|reveal|actual|whole|exact|unhide)\b/i;
 const SENSITIVE_THING = /\b(aadhaa?r|aadhar|adhar|pan|number|details?|documents?|docs|data|profile|info\w*|everything|passport|licen[cs]e)\b/i;
-const asksForFull = (raw) => { const text = String(raw).replace(/\b(full|complete)[ -]?(name|address|postal address)\b/gi, ' '); return asksForFullPlain(text); };
+// Asking for full details is a short request ("show my full Aadhaar"). A long message (a pasted job description, a letter, a form) holds
+// words like "complete" and "information" by chance, so it is never read as that request.
+const SHORT_REQUEST_MAX = 140;
+const asksForFull = (raw) => {
+  if (String(raw).length > SHORT_REQUEST_MAX || require('../controllers/eligibilityController').looksLikeJob(raw)) return false;
+  const text = String(raw).replace(/\b(full|complete)[ -]?(name|address|postal address)\b/gi, ' ');
+  return asksForFullPlain(text);
+};
 const asksForFullPlain = (text) => (FULL_WORD.test(text) && SENSITIVE_THING.test(text))
   || /^\s*(?:show\s+|give\s+me\s+)?(?:it\s+)?(?:full|unmask|reveal|complete)(?:\s+(?:it|details?|number|info))?\s*[.!?]?\s*$/i.test(text);
 
@@ -142,7 +149,7 @@ async function fullDetailsText(user) {
 }
 
 const PERSONAL = /\b(my|mine)\b[\s\S]*\b(name|dob|birth|age|address|phone|mobile|email|aadhaa?r|aadhar|adhar|pan|passport|licen[cs]e|details?|documents?|docs|profile|info\w*|number|father|gender)\b|\b(what|show|tell|give|send)\b[\s\S]*\b(aadhaa?r|aadhar|pan|passport|licen[cs]e)\b/i;
-const asksPersonal = (text) => PERSONAL.test(text);
+const asksPersonal = (text) => String(text).length <= SHORT_REQUEST_MAX && PERSONAL.test(text);
 
 const vaultEntry = (id) => {
   const v = vaults.get(String(id));
@@ -793,6 +800,7 @@ async function handleIncoming(msg, wa) {
 
 exports.handleIncoming = handleIncoming;
 exports.checkPendingJob = checkPendingJob;
+exports.asksForFull = asksForFull;
 exports.askKind = askKind;
 exports.handleKindReply = handleKindReply;
 exports.attach = (wa) => wa.onMessage(handleIncoming);
