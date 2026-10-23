@@ -166,6 +166,41 @@ const buildPendingRegistrationFromOAuth = async (identity) => {
   };
 };
 
+// A verified provider sign-in for an account that is ready to use: link the provider if it is new, then hand the browser
+// a login challenge. The password-less part ends here: the authenticator code is still required to get a session.
+const continueToMfa = async (flow, res, user, provider, identity) => {
+  if (user.status === 'suspended') {
+    return finalizeFlowWithError(flow, res, 'This account has been suspended. Contact support for help.');
+  }
+
+  if (!ensureOAuthLoginReadyUser(user)) {
+    return finalizeFlowWithError(
+      flow,
+      res,
+      'This account has not finished email verification and mandatory MFA enrollment yet. Complete setup with your existing sign-in method before using OAuth.'
+    );
+  }
+
+  applyProviderFields(user, provider, identity);
+  user.authMethods = buildAuthMethodsUpdate(provider, user);
+  await user.save();
+
+  await setOAuthFlowResult(flow, 'mfa', {
+    provider,
+    challengeToken: signLoginChallenge({
+      userId: user._id.toString(),
+      deviceId: flow.deviceId,
+      deviceName: flow.deviceName,
+      clientType: flow.clientType,
+      trustDevice: false,
+      authMethod: provider,
+    }),
+    message: `${provider === 'google' ? 'Google' : 'GitHub'} sign-in verified. Enter your authenticator code to continue.`,
+  });
+
+  return res.redirect(buildFrontendRedirect(flow.flowId));
+};
+
 const finalizeFlowWithError = async (flow, res, message) => {
   if (flow) {
     await setOAuthFlowResult(flow, 'error', { message });
@@ -270,36 +305,7 @@ const providerCallback = (strategyName, provider) => (req, res, next) => {
       }
 
       if (linkedUser) {
-        if (linkedUser.status === 'suspended') {
-          return finalizeFlowWithError(flow, res, 'This account has been suspended. Contact support for help.');
-        }
-
-        if (!ensureOAuthLoginReadyUser(linkedUser)) {
-          return finalizeFlowWithError(
-            flow,
-            res,
-            'This account has not finished email verification and mandatory MFA enrollment yet. Complete setup with your existing sign-in method before using OAuth.'
-          );
-        }
-
-        applyProviderFields(linkedUser, provider, identity);
-        linkedUser.authMethods = buildAuthMethodsUpdate(provider, linkedUser);
-        await linkedUser.save();
-
-        await setOAuthFlowResult(flow, 'mfa', {
-          provider,
-          challengeToken: signLoginChallenge({
-            userId: linkedUser._id.toString(),
-            deviceId: flow.deviceId,
-            deviceName: flow.deviceName,
-            clientType: flow.clientType,
-            trustDevice: false,
-            authMethod: provider,
-          }),
-          message: `${provider === 'google' ? 'Google' : 'GitHub'} sign-in verified. Enter your authenticator code to continue.`,
-        });
-
-        return res.redirect(buildFrontendRedirect(flow.flowId));
+        return continueToMfa(flow, res, linkedUser, provider, identity);
       }
 
       if (!identity.email || !identity.emailVerified) {
@@ -314,11 +320,17 @@ const providerCallback = (strategyName, provider) => (req, res, next) => {
 
       const existingUser = await findUserByEmail(identity.email);
       if (!(await releaseAbandonedAccount(existingUser))) {
-        return finalizeFlowWithError(
-          flow,
-          res,
-          `A FormOS account already exists for ${identity.email}. Sign in with your existing method and link ${provider} from Settings.`
-        );
+        // The provider has verified this email address, and the account with that email is this person's. Link the
+        // provider and continue to the authenticator step, as a normal sign-in would.
+        const otherAccount = existingUser.providers?.[provider]?.providerId;
+        if (otherAccount && otherAccount !== identity.providerId) {
+          return finalizeFlowWithError(
+            flow,
+            res,
+            `A different ${provider === 'google' ? 'Google' : 'GitHub'} account is already linked to ${identity.email}. Sign in with that one, or with your PIN.`
+          );
+        }
+        return continueToMfa(flow, res, existingUser, provider, identity);
       }
 
       const signupPayload = await buildPendingRegistrationFromOAuth(identity);

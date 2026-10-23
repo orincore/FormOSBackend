@@ -59,6 +59,15 @@ const handleValidationErrors = (req, res) => {
 
 const buildRegistrationExpiry = () => new Date(Date.now() + REGISTRATION_TTL_MINUTES * 60 * 1000);
 
+// The picture from the Google or GitHub account the member signed in with most recently (https only).
+const pickProviderAvatar = (user) => {
+  const options = ['google', 'github']
+    .map((name) => user.providers?.[name])
+    .filter((p) => p?.providerId && typeof p.avatarUrl === 'string' && /^https:\/\//i.test(p.avatarUrl))
+    .sort((a, b) => new Date(b.lastLoginAt || b.linkedAt || 0) - new Date(a.lastLoginAt || a.linkedAt || 0));
+  return options[0]?.avatarUrl || null;
+};
+
 const getEffectiveAuthMethods = (user) => ({
   localPin: !!(user.authMethods?.localPin ?? user.pin),
   google: !!(user.authMethods?.google ?? user.providers?.google?.providerId),
@@ -82,6 +91,7 @@ const buildMaskedUser = (user, session = null) => {
       recoveryCodesRemaining: user.security?.mfa?.backupCodeHashes?.length || 0,
       mfaResetRequired: !!user.security?.mfa?.resetRequired,
     },
+    avatarUrl: pickProviderAvatar(user),
     authMethods: getEffectiveAuthMethods(user),
     providers: {
       google: {

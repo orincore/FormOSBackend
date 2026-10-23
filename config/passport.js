@@ -21,7 +21,7 @@ if (providerConfig.google) {
         provider: 'google',
         providerId: profile.id,
         email: primaryEmail,
-        emailVerified: !!profile._json?.email_verified,
+        emailVerified: profile._json?.email_verified === true || profile._json?.email_verified === 'true' || profile.emails?.[0]?.verified === true || profile.emails?.[0]?.verified === 'true',
         name: profile.displayName || primaryEmail || 'Google User',
         avatarUrl: profile.photos?.[0]?.value || null,
         profileUrl: null,
