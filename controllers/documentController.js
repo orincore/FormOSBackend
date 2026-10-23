@@ -68,7 +68,9 @@ exports.savePlainDocument = savePlainDocument;
 
 // Reads an already stored standard document again with the AI reader (used once for documents saved by the older reader). The
 // member's profile is left as it is, so an old document cannot overwrite newer details.
-exports.reprocessDocument = async (document) => {
+exports.reprocessDocument = async (given) => {
+  const document = await Document.findById(given._id || given);
+  if (!document || document.securityVersion === 2) return;
   const buffer = await StorageService.downloadFile(document);
   const temp = path.join(os.tmpdir(), `reread-${Date.now()}-${path.basename(document.originalName || 'file')}`);
   await fs.writeFile(temp, buffer);
