@@ -480,7 +480,7 @@ async function describeUpload(documentId, reveal = false, userId = null) {
   const d = docFields.cleanKnown(doc.structuredData || {});
   // The AI already named and summarised the document when it was read: that is what the member is told. The question below
   // only asks them to correct it when the AI could not tell what it was.
-  const preview = buildPreview(doc);
+  const preview = buildPreview(doc, { reveal });
   const sure = preview.kind !== 'other' || Boolean(d.documentTitle);
   const guess = sure ? { key: preview.kind, label: d.documentTitle || preview.kindLabel } : null;
   const rows = [
@@ -492,7 +492,7 @@ async function describeUpload(documentId, reveal = false, userId = null) {
   if (!rows.length) return `I saved the file, but could not find any details in it. A clearer photo or a PDF usually works better.${ask(guess)}`;
   const extras = preview.facts.map((f) => [f.label, f.value]);
   const tail = sure ? '' : ask(guess);
-  return `Saved${guess ? ` as *${guess.label}*` : ''}.${d.documentSummary ? `\n${d.documentSummary}` : ''}\n\n${[...rows, ...extras].map(([k, v]) => `*${k}*: ${v}`).join('\n')}\n\nEverything on it is saved, so you can ask me anything about it. If a detail is wrong, you can correct it in the app under Documents.${tail}`;
+  return `Saved${guess ? ` as *${guess.label}*` : ''}.${preview.summary ? `\n${preview.summary}` : ''}\n\n${[...rows, ...extras].map(([k, v]) => `*${k}*: ${v}`).join('\n')}\n\nEverything on it is saved, so you can ask me anything about it. If a detail is wrong, you can correct it in the app under Documents.${tail}`;
 }
 
 async function listDocuments(user) {

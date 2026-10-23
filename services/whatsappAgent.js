@@ -253,8 +253,8 @@ async function recordsFor(ctx) {
     const lines = Object.entries(sd)
       .filter(([k, v]) => !docFields.HIDDEN_KEYS.has(k) && !docFields.ALIAS_KEYS.has(k) && v !== '' && v != null)
       .map(([k, v]) => `${docFields.labelOf(k)}: ${SENSITIVE.has(k) ? `****${String(v).replace(/[^A-Za-z0-9]/g, '').slice(-4)}` : maskIds(String(v).slice(0, 400))}`);
-    const head = `Document ${i + 1}: ${sd.documentTitle || TYPE_LABEL[sd.documentType] || d.originalName} (file ${d.originalName}, added ${new Date(d.uploadedAt).toLocaleDateString('en-GB')})`;
-    const block = [head, sd.documentSummary ? `Summary: ${sd.documentSummary}` : '', ...lines].filter(Boolean).join('\n');
+    const head = `Document ${i + 1}: ${maskIds(sd.documentTitle || '') || TYPE_LABEL[sd.documentType] || d.originalName} (file ${d.originalName}, added ${new Date(d.uploadedAt).toLocaleDateString('en-GB')})`;
+    const block = [head, sd.documentSummary ? `Summary: ${maskIds(sd.documentSummary)}` : '', ...lines].filter(Boolean).join('\n');
     if (total + block.length > 40000) return;
     total += block.length;
     blocks.push(block);

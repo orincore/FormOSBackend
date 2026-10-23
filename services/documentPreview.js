@@ -5,6 +5,7 @@
 const sharp = require('sharp');
 const docFields = require('./documentFields');
 const docKind = require('./whatsappDocKind');
+const { maskSensitiveText } = require('./securityService');
 
 const KIND_LABEL = {
   aadhaar: 'Aadhaar card', pan: 'PAN card', passport: 'Passport', license: 'Driving licence', voter: 'Voter ID',
@@ -37,10 +38,12 @@ function kindOf(document) {
   return 'other';
 }
 
-function buildPreview(document) {
+// `reveal` is true only after the member confirmed their PIN: otherwise every ID number is masked, including inside the AI's sentence.
+function buildPreview(document, { reveal = false } = {}) {
+  const safe = (text) => (reveal ? String(text || '') : maskSensitiveText(String(text || '')));
   const sd = docFields.cleanKnown(document.structuredData || {});
   const kind = kindOf(document);
-  const title = String(sd.documentTitle || '').trim() || KIND_LABEL[kind] || 'Document';
+  const title = safe(String(sd.documentTitle || '').trim()) || KIND_LABEL[kind] || 'Document';
   const idField = ID_FIELD[kind];
 
   const facts = [];
@@ -48,14 +51,14 @@ function buildPreview(document) {
   for (const re of FACT_PRIORITY) {
     for (const [k, v] of extras) {
       if (facts.length >= 3) break;
-      if (re.test(k) && !facts.some((f) => f.key === k)) facts.push({ key: k, label: docFields.labelOf(k), value: v });
+      if (re.test(k) && !facts.some((f) => f.key === k)) facts.push({ key: k, label: docFields.labelOf(k), value: safe(v) });
     }
   }
   return {
     kind,
     kindLabel: KIND_LABEL[kind] || 'Document',
     title,
-    summary: String(sd.documentSummary || '').trim(),
+    summary: safe(String(sd.documentSummary || '').trim()),
     last4: idField && sd[idField] ? last4(sd[idField]) : '',
     holder: sd.fullName || '',
     facts: facts.map(({ label, value }) => ({ label, value })),

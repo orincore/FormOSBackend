@@ -11,6 +11,7 @@
 const sharp = require('sharp');
 const aiService = require('./aiService');
 const docFields = require('./documentFields');
+const { maskSensitiveText } = require('./securityService');
 
 const MAX_FIELDS = 200;
 const visionModel = () => process.env.AI_VISION_MODEL || 'openai/gpt-4o';
@@ -42,6 +43,7 @@ Rules:
 - One row per THING, never one row per printed line. When a subject or course is printed on several lines (for example separate lines for its theory, practical, exam and internal marks) merge them into ONE row and add columns for each part, such as ["Course","Theory max","Theory obtained","Practical max","Practical obtained","Internal max","Internal obtained","Total","Credits"], or "ESE max/obtained" and "PA max/obtained". The first column is always the name of the thing (the course, the lender, the date), repeated for every line it covers, so the labelColumn is 0 and each name appears only once.
 - For a credit report always give fields for: the score (for example label "CIBIL Score"), score date, control or report number, report date, number of accounts, active and closed accounts, overdue amount, total outstanding, and enquiry counts, when they are printed.
 - Always capture, as fields, who issued or produced the document (the board, university, bank, company or authority, with its full name), the document, reference or certificate number, and every date printed on it.
+- Never write an ID, account, card or phone number in documentTitle or summary (say "with an Aadhaar number", not the number): they are shown in lists.
 - Dates as DD/MM/YYYY. People's names in Title Case. Aadhaar as 12 digits, PAN as 10 characters.
 - documentType "other" is for anything that is none of the listed kinds (a bill, a certificate of any kind, a letter, a form, a receipt ...): then say exactly what it is in documentTitle and describe it in summary. Any kind of document is welcome; your job is to work out what it is and capture all of its information.`;
 
@@ -95,7 +97,9 @@ async function buildMessages({ buffer, mimeType, fileName }) {
 function normalize(parsed) {
   const typeKey = String(parsed.documentType || '').toLowerCase().replace(/[^a-z_]/g, '');
   const documentType = TYPE_MAP[typeKey] || 'other';
-  const title = cleanText(parsed.documentTitle).slice(0, 80);
+  // The title and the summary are shown in lists, so ID numbers are masked in them as they are saved (the numbers themselves are
+  // kept in their own fields).
+  const title = maskSensitiveText(cleanText(parsed.documentTitle)).slice(0, 80);
   const ocr = require('./ocrService');
   const known = {};
   const holder = parsed.holder && typeof parsed.holder === 'object' ? parsed.holder : {};
@@ -171,7 +175,7 @@ function normalize(parsed) {
   for (const f of (Array.isArray(parsed.fields) ? parsed.fields : []).slice(0, MAX_FIELDS)) {
     addField(f?.label, f?.value);
   }
-  const summary = cleanText(parsed.summary).slice(0, 240);
+  const summary = maskSensitiveText(cleanText(parsed.summary)).slice(0, 240);
   return { documentType, documentTitle: title, documentSummary: summary, known, fields: docFields.cleanFields(fields) };
 }
 

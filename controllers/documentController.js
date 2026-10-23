@@ -14,8 +14,18 @@ const docKind = require('../services/whatsappDocKind');
 const TOP_LEVEL_TYPES = new Set(['aadhaar', 'pan', 'passport', 'license']);
 const { flags } = require('../config/featureFlags');
 
+// The usual sensitive fields are masked by name; every other value (the AI's one-line summary, an enrolment or account number ...)
+// is scanned for ID-shaped numbers, so no full number leaks through a field the app does not know by name.
+const maskListData = (data) => {
+  const masked = maskStructuredData(data);
+  for (const [key, value] of Object.entries(masked)) {
+    if (typeof value === 'string' && !docFields.KNOWN_KEYS.includes(key)) masked[key] = maskSensitiveText(value);
+  }
+  return masked;
+};
+
 const serializeDocument = (document, { reveal = false } = {}) => ({
-  ...(document.securityVersion === 2 ? {} : { thumbnail: document.thumbnail || '', preview: buildPreview(document) }),
+  ...(document.securityVersion === 2 ? {} : { thumbnail: document.thumbnail || '', preview: buildPreview(document, { reveal }) }),
   id: document._id,
   originalName: document.originalName,
   documentType: document.documentType,
@@ -26,7 +36,7 @@ const serializeDocument = (document, { reveal = false } = {}) => ({
   uploadedAt: document.uploadedAt,
   structuredData: reveal
     ? docFields.cleanKnown(document.structuredData || {})
-    : maskStructuredData(docFields.cleanKnown(document.structuredData || {})),
+    : maskListData(docFields.cleanKnown(document.structuredData || {})),
   extractedText: reveal ? document.extractedText || '' : maskSensitiveText(document.extractedText || ''),
   ...(document.securityVersion === 2 ? {
     encryptedText: document.encryptedText || null,
