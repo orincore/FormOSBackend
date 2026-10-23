@@ -20,8 +20,8 @@ const serializeDocument = (document, { reveal = false } = {}) => ({
   storageType: document.storageType,
   uploadedAt: document.uploadedAt,
   structuredData: reveal
-    ? document.structuredData || {}
-    : maskStructuredData(document.structuredData || {}),
+    ? (document.securityVersion === 2 ? document.structuredData || {} : docFields.cleanKnown(document.structuredData || {}))
+    : maskStructuredData(document.securityVersion === 2 ? document.structuredData || {} : docFields.cleanKnown(document.structuredData || {})),
   extractedText: reveal ? document.extractedText || '' : maskSensitiveText(document.extractedText || ''),
   ...(document.securityVersion === 2 ? {
     encryptedText: document.encryptedText || null,
@@ -490,6 +490,10 @@ exports.updateStructuredData = async (req, res) => {
           .filter(([key, value]) => /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(key) && ['string', 'number'].includes(typeof value))
           .map(([key, value]) => [key, String(value).trim().slice(0, 500)])
       );
+      // A usual field has to look like what it holds, so a mistyped correction cannot put a paragraph in a name or a bad Aadhaar number in the profile.
+      const KIND = { fullName: 'name', fatherName: "father's name", dateOfBirth: 'date of birth (DD/MM/YYYY)', gender: 'gender', aadhaarNumber: 'Aadhaar number (12 digits)', panNumber: 'PAN number (like ABCDE1234F)', passportNumber: 'passport number', drivingLicenseNumber: 'licence number', pincode: 'PIN code (6 digits)', phone: 'phone number (10 digits)', email: 'email address', state: 'state', address: 'address' };
+      const bad = Object.entries(structuredData).find(([key, value]) => docFields.KNOWN_KEYS.includes(key) && value && !docFields.valueFitsKey(key, value));
+      if (bad) return res.status(400).json({ success: false, message: `That is not a valid ${KIND[bad[0]] || bad[0]}. Check it against your document.` });
     }
 
     const updateFields = {};
@@ -577,7 +581,7 @@ exports.deleteDocument = async (req, res) => {
 
     const merged = {};
     for (const doc of remainingDocs) {
-      if (doc.structuredData) Object.assign(merged, doc.structuredData);
+      if (doc.structuredData) Object.assign(merged, docFields.cleanKnown(doc.structuredData));
     }
 
     await User.findByIdAndUpdate(req.userId, { extractedData: merged });

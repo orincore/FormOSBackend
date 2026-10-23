@@ -278,6 +278,8 @@ class OCRService {
 
   detectDocumentType(text) {
     const t = text.toUpperCase();
+    // Reports and statements quote a PAN and other ID numbers, but they are not the ID itself.
+    if (/CREDIT\s+(?:REPORT|INFORMATION\s+REPORT|SCORE)|\bCIBIL\b|TRANSUNION|\bEXPERIAN\b|\bEQUIFAX\b|BANK\s+STATEMENT|ACCOUNT\s+STATEMENT|\bINVOICE\b|PAY\s*SLIP|SALARY\s+SLIP|FORM[\s-]*16\b/.test(t) && !/AADHAAR|UIDAI/.test(t)) return 'other';
     if (/INCOME TAX DEPARTMENT|PERMANENT ACCOUNT NUMBER/.test(t) || /\b[A-Z]{5}\d{4}[A-Z]\b/.test(t) && !/AADHAAR|UIDAI/.test(t)) return 'pan';
     if (/AADHAAR|UIDAI|UNIQUE IDENTIFICATION|आधार/.test(t)) return 'aadhaar';
     for (const m of t.matchAll(/\b([2-9]\d{3})\s?(\d{4})\s?(\d{4})\b/g)) if (this.isValidAadhaar(m[1] + m[2] + m[3])) return 'aadhaar';
@@ -354,6 +356,13 @@ class OCRService {
     };
     const name = nameLine('(?:Full\\s+)?Name');
     if (name && !/father|mother/i.test(name)) data.fullName = this.toTitleCase(name);
+    if (!data.fullName) {
+      // Reports and statements print "CONSUMER NAME ADARSH SURADKAR DOB GENDER ..." with the next label straight after the
+      // name: the name is the few words between the label and that next label.
+      const inline = flat.match(/(?:^|\n)\s*(?:CONSUMER\s+|CUSTOMER\s+|APPLICANT\s+|HOLDER\s+)?NAME\s*[:\-]?\s+([A-Za-z][A-Za-z .']*?)(?=\s+(?:DOB|D\.O\.B|DATE\s+OF\s+BIRTH|GENDER|SEX|FATHER|MOTHER|SPOUSE|PAN|ADDRESS|MOBILE|PHONE|EMAIL|CREDIT|ACCOUNT)\b|\s*\n|$)/i);
+      const words = inline ? inline[1].trim().split(/\s+/) : [];
+      if (words.length >= 2 && words.length <= 5 && require('./documentFields').valueFitsKey('fullName', words.join(' '))) data.fullName = this.toTitleCase(words.join(' '));
+    }
     if (!data.fullName && type === 'aadhaar') {
       // On an Aadhaar card the holder's name is printed on the line above the date of birth.
       const at = lines.findIndex((l) => /^(?:DOB|D\.O\.B|Date\s+of\s+Birth|Year\s+of\s+Birth)/i.test(l));
@@ -426,11 +435,13 @@ Output ONLY one raw JSON object with exactly these keys: ${FIELDS.join(', ')}.`;
         let value = typeof ai[key] === 'string' ? ai[key].trim() : '';
         if (!value) continue;
         if (key === 'aadhaarNumber') { value = value.replace(/\s/g, ''); if (!this.isValidAadhaar(value) || merged[key]) continue; }
+        else if (['passportNumber', 'drivingLicenseNumber'].includes(key)) { value = value.toUpperCase(); if (merged[key] || !require('./documentFields').valueFitsKey(key, value)) continue; }
         else if (key === 'panNumber') { value = value.toUpperCase(); if (!/^[A-Z]{5}\d{4}[A-Z]$/.test(value) || merged[key]) continue; }
         else if (key === 'dateOfBirth') { value = this.normalizeDate(value); if (!value || merged[key]) continue; }
         else if (key === 'pincode') { if (!/^[1-9]\d{5}$/.test(value)) continue; }
         else if (key === 'phone') { value = value.replace(/\D/g, '').slice(-10); if (!/^[6-9]\d{9}$/.test(value)) continue; }
         else if (key === 'documentType') { value = value.toLowerCase(); }
+        else if (!require('./documentFields').valueFitsKey(key, value)) continue; // a paragraph is not a name, a heading is not a state
         else if (merged[key] && merged[key].length >= value.length) continue; // keep the longer, already-read value
         merged[key] = value;
       }

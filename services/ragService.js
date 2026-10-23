@@ -31,7 +31,17 @@ class RAGService {
         return directAnswer;
       }
 
-      const context = this.prepareContext(userData, { reveal });
+      let context = this.prepareContext(userData, { reveal });
+      // The model does not know today's date, so it would guess an age from the birth year. The code works it out.
+      const now = new Date();
+      context += `Today's date: ${now.toLocaleDateString('en-GB')}\n`;
+      const dob = this.getNormalizedProfile(userData).dateOfBirth.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+      if (dob) {
+        const born = new Date(Number(dob[3]), Number(dob[2]) - 1, Number(dob[1]));
+        let age = now.getFullYear() - born.getFullYear();
+        if (now < new Date(now.getFullYear(), born.getMonth(), born.getDate())) age--;
+        if (age >= 0 && age < 120) context += `Age: ${age} years\n`;
+      }
       const systemPrompt = 'You are FormOS AI Assistant. You help users access their stored personal data securely.';
 
       const userPrompt = `Answer the user's question ONLY based on their stored data.

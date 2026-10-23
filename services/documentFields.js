@@ -182,6 +182,11 @@ function valueFitsKey(key, value) {
     case 'email': return /^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$/.test(v);
     case 'address': return v.length >= 8 && v.length <= 250 && v.split(/[\s,]+/).filter(Boolean).length >= 3 && !/^(?:identity|card|government|election|name|date|signature|father|mother)\b/i.test(v) && (/\b[1-9]\d{5}\b/.test(v) || !NAME_STOP.test(v.split(/[,\n]/)[0]));
     case 'state': return /^[A-Za-z .&-]{2,40}$/.test(v) && !/board|education|commission/i.test(v);
+    // Identity numbers: a number that only looks like one (a report's control number, an account number) is not stored under them.
+    case 'aadhaarNumber': { const d = v.replace(/[\s-]/g, ''); return /^\d{12}$/.test(d) && require('./ocrService').isValidAadhaar(d); }
+    case 'panNumber': return /^[A-Z]{5}\d{4}[A-Z]$/.test(v.toUpperCase());
+    case 'passportNumber': return /^[A-Z]\d{7}$/.test(v.toUpperCase().replace(/\s/g, ''));
+    case 'drivingLicenseNumber': return /^[A-Z0-9][A-Z0-9 /-]{7,19}$/i.test(v) && /\d/.test(v) && /[A-Z]/i.test(v);
     default: return true;
   }
 }
@@ -995,6 +1000,20 @@ function assembleStructured({ known = {}, fields = {}, documentTitle = '' }) {
   return out;
 }
 
+// Drops usual-field values that cannot be what the field holds (a paragraph as a name, a control number as an Aadhaar number).
+// Used when a record is shown, so documents saved before these checks existed are cleaned without being uploaded again.
+function cleanKnown(record) {
+  const out = { ...(record || {}) };
+  for (const key of KNOWN_KEYS) {
+    const v = out[key];
+    if (typeof v !== 'string') continue;
+    // masked values (****1234) are display copies, not something to judge
+    if (/^[*xX•\s-]*\d{0,4}$/.test(v) && /[*xX•]/.test(v)) continue;
+    if (PLACEHOLDER_VALUE.test(v) || !valueFitsKey(key, v)) delete out[key];
+  }
+  return out;
+}
+
 // Cleans a record that was saved by an older version without ever throwing good data away: every usual field stays, a dynamic field
 // stays only if it passes today's rules (a real label, a value that fits it), typed values are tidied, and fields the fresh reading
 // found that the old record lacks are added. `fresh` is a new reading of the same document.
@@ -1030,6 +1049,6 @@ function cleanFields_keepKnown(record) {
 }
 
 module.exports = {
-  repairRecord, findInText, parseAiJson, reviewWithAI, assembleStructured, wordsToNumber, unglue, itemFields, marksheetSummary, cleanFields, tidyValue, normalizeLabel, KNOWN_KEYS, HIDDEN_KEYS, ALIAS_KEYS, labelToKey, keyToLabel, labelOf, genericFields, genericPairs, titleFor, extractFields,
+  cleanKnown, valueFitsKey, grounded, repairRecord, findInText, parseAiJson, reviewWithAI, assembleStructured, wordsToNumber, unglue, itemFields, marksheetSummary, cleanFields, tidyValue, normalizeLabel, KNOWN_KEYS, HIDDEN_KEYS, ALIAS_KEYS, labelToKey, keyToLabel, labelOf, genericFields, genericPairs, titleFor, extractFields,
   searchFields, formatMatches, pickFieldsWithAI, isSensitive, maskValue, tokens, scoreLabel,
 };
