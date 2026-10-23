@@ -400,7 +400,8 @@ async function processOCR(documentId, filePathOrKey, userId, useS3 = false, { up
       extractedText,
       structuredData: stored,
       fieldsExtractedAt: new Date(),
-      ...(finalKind ? { documentType: finalKind } : {}),
+      // When the AI read it, its answer is the kind, including "not an ID card" (so a stale label from an older reader is replaced).
+      ...(finalKind ? { documentType: finalKind } : (read ? { documentType: 'other' } : {})),
       thumbnail: await makeThumbnail(fileBuffer, named?.mimeType),
       ...(read ? { aiReadAt: new Date() } : {}),
       ocrStatus: 'completed',
