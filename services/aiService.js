@@ -28,7 +28,11 @@ const OPERATION_POLICIES = {
 
 class AIService {
   constructor() {
-    this.provider = process.env.AI_PROVIDER || 'openrouter'; // 'gemini', 'openai', 'openrouter', 'cleanapi'
+    // CleanAPI is the primary provider and OpenRouter the fallback. AI_PROVIDER can still pick another one ('openrouter',
+    // 'gemini', 'openai'); with 'cleanapi' (the default when a CleanAPI key exists) or 'openrouter' the other one is
+    // used as the fallback whenever its key is set.
+    this.provider = process.env.AI_PROVIDER || (process.env.CLEANAPI_API_KEY ? 'cleanapi' : 'openrouter'); // 'cleanapi', 'openrouter', 'gemini', 'openai'
+    this.blockedUntil = {};
 
     if (this.provider === 'gemini') {
       const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -37,7 +41,19 @@ class AIService {
     } else if (this.provider === 'openai') {
       const OpenAI = require('openai');
       this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    } else if (this.provider === 'openrouter') {
+    }
+
+    const wantsCleanApi = this.provider === 'cleanapi' || (['cleanapi', 'openrouter'].includes(this.provider) && process.env.CLEANAPI_API_KEY);
+    const wantsOpenRouter = this.provider === 'openrouter' || (this.provider === 'cleanapi' && process.env.OPENROUTER_API_KEY);
+    if (wantsCleanApi) {
+      const OpenAI = require('openai');
+      this.cleanapi = new OpenAI({
+        baseURL: process.env.CLEANAPI_BASE_URL || 'https://cleanapis.com/v1',
+        apiKey: process.env.CLEANAPI_API_KEY || 'no-key',
+      });
+      this.cleanapiModel = process.env.CLEANAPI_MODEL || 'gemini-3.7-flash';
+    }
+    if (wantsOpenRouter) {
       const OpenAI = require('openai');
       this.openrouter = new OpenAI({
         baseURL: 'https://openrouter.ai/api/v1',
@@ -47,45 +63,65 @@ class AIService {
           'X-Title': 'FormOS'
         }
       });
-    } else if (this.provider === 'cleanapi') {
-      const OpenAI = require('openai');
-      this.cleanapi = new OpenAI({
-        baseURL: process.env.CLEANAPI_BASE_URL || 'https://cleanapis.com/v1',
-        apiKey: process.env.CLEANAPI_API_KEY || 'no-key',
-      });
-      this.cleanapiModel = process.env.CLEANAPI_MODEL || 'gemini-3.7-flash';
     }
 
-    // ── CleanAPI fallback (always initialized if key present) ──────────────
-    // Primary = OpenRouter, fallback = CleanAPI when OpenRouter fails.
-    if (!this.cleanapi && process.env.CLEANAPI_API_KEY) {
+    const chain = this.chain();
+    console.log(chain.length ? `🤖 AI providers: ${chain.map((n, i) => `${n}${i === 0 ? ' (primary)' : ' (fallback)'}`).join(' → ')}` : `🤖 AI Provider: ${this.provider.toUpperCase()}`);
+  }
+
+  // The providers to try, in order: the primary first, then the fallback when its key is set.
+  chain() {
+    const have = { cleanapi: Boolean(this.cleanapi && process.env.CLEANAPI_API_KEY), openrouter: Boolean(this.openrouter && process.env.OPENROUTER_API_KEY) };
+    if (!['cleanapi', 'openrouter'].includes(this.provider)) return [];
+    const order = this.provider === 'cleanapi' ? ['cleanapi', 'openrouter'] : ['openrouter', 'cleanapi'];
+    return order.filter((name) => have[name]);
+  }
+
+  label(name) { return name === 'cleanapi' ? 'CleanAPI' : 'OpenRouter'; }
+
+  // When a provider says it is rate limited (a free tier has a daily cap), skip it for a while and let the next one answer
+  // straight away instead of spending a failed request on every message.
+  coolingDown(name) {
+    return this.chain().length > 1 && this.blockedUntil[name] && this.blockedUntil[name] > Date.now();
+  }
+
+  noteFailure(name, error) {
+    if (this.chain().length < 2) return;
+    const text = String(error?.message || error);
+    // A billing or key problem will not fix itself in seconds: skip that provider for much longer than a rate limit.
+    if (/\b(401|402|403)\b|billing|payment|unauthori[sz]ed|invalid api key|insufficient/i.test(text)) {
+      this.blockedUntil[name] = Date.now() + (parseInt(process.env.AI_AUTH_COOLDOWN_MS, 10) || 30 * 60 * 1000);
+      console.warn(`${this.label(name)} was refused (billing or key problem): using the other provider directly for the next 30 minutes. Fix the account to switch back.`);
+    } else if (/\b(502|503|504)\b|being upgraded|temporarily unavailable|service unavailable|econnreset|etimedout|enotfound|fetch failed/i.test(text)) {
+      // A provider that is down for maintenance: stop trying it for a minute instead of failing on every request first.
+      this.blockedUntil[name] = Date.now() + (parseInt(process.env.AI_OUTAGE_COOLDOWN_MS, 10) || 60 * 1000);
+      console.warn(`${this.label(name)} is unavailable: using the other provider directly for the next minute`);
+    } else if (/\b429\b|rate limit/i.test(text)) {
+      this.blockedUntil[name] = Date.now() + (parseInt(process.env.AI_PRIMARY_COOLDOWN_MS, 10) || 10 * 60 * 1000);
+      console.warn(`${this.label(name)} is rate limited: using the other provider directly for the next few minutes`);
+    }
+  }
+
+  // Runs `call(name, timeout)` on each provider in turn until one answers. A provider that is cooling down is skipped
+  // unless it is the last one left. The primary gets `primaryTimeout`; the last provider gets the longer fallback timeout.
+  async withFallback(call, { primaryTimeout, fallbackTimeout, retries }) {
+    const chain = this.chain();
+    const errors = [];
+    for (let i = 0; i < chain.length; i++) {
+      const name = chain[i];
+      const last = i === chain.length - 1;
+      if (!last && this.coolingDown(name)) { errors.push(`${this.label(name)} skipped while rate limited`); continue; }
       try {
-        const OpenAI = require('openai');
-        this.cleanapi = new OpenAI({
-          baseURL: process.env.CLEANAPI_BASE_URL || 'https://cleanapis.com/v1',
-          apiKey: process.env.CLEANAPI_API_KEY,
-        });
-        this.cleanapiModel = process.env.CLEANAPI_MODEL || 'gemini-3.7-flash';
-        console.log(`🔄 CleanAPI fallback configured: ${this.cleanapiModel} @ ${process.env.CLEANAPI_BASE_URL || 'https://cleanapis.com/v1'}`);
-      } catch (e) {
-        console.warn('⚠️  CleanAPI fallback init failed:', e.message);
+        const result = await call(name, last ? fallbackTimeout : primaryTimeout, last, retries);
+        if (i > 0) console.log(`↩️  Answered by the fallback (${this.label(name)})`);
+        return result;
+      } catch (error) {
+        this.noteFailure(name, error);
+        errors.push(`${this.label(name)}: ${error.message}`);
+        console.warn(`⚠️  ${this.label(name)} failed: ${error.message}`);
       }
     }
-
-    console.log(`🤖 AI Provider: ${this.provider.toUpperCase()}${this.cleanapi ? ' (CleanAPI fallback enabled)' : ''}`);
-  }
-
-  // When OpenRouter says it is rate limited (its free tier has a daily cap), skip it for a while and let CleanAPI
-  // answer straight away instead of spending a failed request on every message.
-  primaryCoolingDown() {
-    return Boolean(this.cleanapi) && this.primaryBlockedUntil && this.primaryBlockedUntil > Date.now();
-  }
-
-  notePrimaryFailure(error) {
-    if (this.cleanapi && /\b429\b|rate limit/i.test(String(error?.message || error))) {
-      this.primaryBlockedUntil = Date.now() + (parseInt(process.env.AI_PRIMARY_COOLDOWN_MS, 10) || 10 * 60 * 1000);
-      console.warn('OpenRouter is rate limited: using CleanAPI directly for the next few minutes');
-    }
+    throw new Error(errors.length ? errors.join(' | ') : 'No AI provider is configured');
   }
 
   async chat(systemPrompt, userPrompt, options = {}) {
@@ -97,27 +133,11 @@ class AIService {
         return await this.chatWithGemini(systemPrompt, userPrompt);
       } else if (this.provider === 'openai') {
         return await this.chatWithOpenAI(systemPrompt, userPrompt);
-      } else if (this.provider === 'openrouter') {
-        try {
-          if (this.primaryCoolingDown()) throw new Error('OpenRouter skipped while rate limited');
-          return await this.chatWithOpenRouter(systemPrompt, userPrompt);
-        } catch (openRouterError) {
-          this.notePrimaryFailure(openRouterError);
-          console.warn(`⚠️  OpenRouter failed: ${openRouterError.message}`);
-          if (this.cleanapi) {
-            console.log('↩️  Falling back to CleanAPI...');
-            try {
-              return await this.chatWithCleanAPI(systemPrompt, userPrompt);
-            } catch (cleanApiError) {
-              console.error('❌ CleanAPI fallback also failed:', cleanApiError.message);
-              // Throw combined error so caller sees both failures
-              throw new Error(`OpenRouter failed: ${openRouterError.message} | CleanAPI fallback failed: ${cleanApiError.message}`);
-            }
-          }
-          throw openRouterError;
-        }
-      } else if (this.provider === 'cleanapi') {
-        return await this.chatWithCleanAPI(systemPrompt, userPrompt);
+      } else if (['cleanapi', 'openrouter'].includes(this.provider)) {
+        return await this.withFallback(
+          (name, timeout, last, retries) => (name === 'cleanapi' ? this.chatWithCleanAPI(systemPrompt, userPrompt, timeout, retries !== undefined ? retries : (last ? 1 : 0)) : this.chatWithOpenRouter(systemPrompt, userPrompt, timeout)),
+          { primaryTimeout: options.primaryTimeout || parseInt(process.env.AI_PRIMARY_TIMEOUT_MS, 10) || 25000, fallbackTimeout: options.fallbackTimeout || parseInt(process.env.AI_FALLBACK_TIMEOUT_MS, 10) || 60000, retries: options.retries }
+        );
       }
       throw new Error(`Unknown AI provider: ${this.provider}`);
     } catch (error) {
@@ -128,7 +148,7 @@ class AIService {
   }
 
   // One planning step for an assistant that can use tools. `messages` and `tools` are in the OpenAI chat format.
-  // OpenRouter is tried first and CleanAPI answers if it fails (a model without tool support counts as failing).
+  // The primary provider is tried first and the fallback answers if it fails (a model without tool support counts as failing).
   // Returns the model's message: { content, tool_calls }. The same Security V2 policy guard applies as for chat().
   async chatWithTools(messages, tools, options = {}) {
     this.enforcePolicyGuard(messages[0]?.content || '', messages.slice(1).map((m) => (typeof m.content === 'string' ? m.content : '')).join('\n'), options);
@@ -144,28 +164,12 @@ class AIService {
     };
 
     // Planning is a short answer, so a slow primary is given less time before the fallback takes over.
-    const primaryTimeout = parseInt(process.env.AI_PLAN_PRIMARY_TIMEOUT_MS, 10) || 12000;
-    const fallbackTimeout = parseInt(process.env.AI_FALLBACK_TIMEOUT_MS, 10) || 60000;
-    let primaryError = null;
-
-    if (this.openrouter && process.env.OPENROUTER_API_KEY && !this.primaryCoolingDown()) {
-      try {
-        return await attempt(this.openrouter, process.env.OPENROUTER_MODEL || 'openrouter/free', primaryTimeout);
-      } catch (error) {
-        primaryError = error;
-        this.notePrimaryFailure(error);
-        console.warn(`OpenRouter could not plan this step: ${error.message}`);
-      }
-    }
-    if (this.cleanapi) {
-      try {
-        if (primaryError) console.log('Planning answered by the CleanAPI fallback');
-        return await attempt(this.cleanapi, this.cleanapiModel || process.env.CLEANAPI_MODEL || 'gemini-3.7-flash', fallbackTimeout);
-      } catch (error) {
-        throw new Error(`CleanAPI could not plan this step: ${error.message}${primaryError ? ` (OpenRouter: ${primaryError.message})` : ''}`);
-      }
-    }
-    throw primaryError || new Error('No AI provider is configured for tool use');
+    return this.withFallback(
+      (name, timeout) => (name === 'cleanapi'
+        ? attempt(this.cleanapi, this.cleanapiModel || process.env.CLEANAPI_MODEL || 'gemini-3.7-flash', timeout)
+        : attempt(this.openrouter, process.env.OPENROUTER_MODEL || 'openrouter/free', timeout)),
+      { primaryTimeout: parseInt(process.env.AI_PLAN_PRIMARY_TIMEOUT_MS, 10) || 12000, fallbackTimeout: parseInt(process.env.AI_FALLBACK_TIMEOUT_MS, 10) || 60000 }
+    );
   }
 
   enforcePolicyGuard(systemPrompt, userPrompt, options) {
@@ -284,7 +288,7 @@ class AIService {
     return response.choices[0].message.content;
   }
 
-  async chatWithOpenRouter(systemPrompt, userPrompt) {
+  async chatWithOpenRouter(systemPrompt, userPrompt, timeout = parseInt(process.env.AI_PRIMARY_TIMEOUT_MS, 10) || 25000) {
     try {
       const model = process.env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-exp:free';
       console.log('OpenRouter: Sending request with model:', model);
@@ -297,7 +301,7 @@ class AIService {
         ],
         temperature: 0.3,
         max_tokens: 2000,
-      }, { timeout: parseInt(process.env.AI_PRIMARY_TIMEOUT_MS, 10) || 25000, maxRetries: 0 });
+      }, { timeout, maxRetries: 0 });
 
       console.log('OpenRouter: Response received:', {
         id: response.id,
@@ -339,7 +343,7 @@ class AIService {
     }
   }
 
-  async chatWithCleanAPI(systemPrompt, userPrompt) {
+  async chatWithCleanAPI(systemPrompt, userPrompt, timeout = parseInt(process.env.AI_FALLBACK_TIMEOUT_MS, 10) || 60000, retries = 1) {
     try {
       const model = this.cleanapiModel || process.env.CLEANAPI_MODEL || 'gemini-3.7-flash';
       const baseURL = process.env.CLEANAPI_BASE_URL || 'https://cleanapis.com/v1';
@@ -353,7 +357,7 @@ class AIService {
         ],
         temperature: 0.3,
         max_tokens: 2000,
-      }, { timeout: parseInt(process.env.AI_FALLBACK_TIMEOUT_MS, 10) || 60000, maxRetries: 1 });
+      }, { timeout, maxRetries: retries });
 
       console.log('CleanAPI: Response received:', {
         id: response.id,
@@ -391,17 +395,10 @@ class AIService {
 
   // Check if AI is configured
   isConfigured() {
-    if (this.provider === 'gemini') {
-      return !!process.env.GEMINI_API_KEY;
-    } else if (this.provider === 'openai') {
-      return !!process.env.OPENAI_API_KEY;
-    } else if (this.provider === 'openrouter') {
-      // Configured if either primary or fallback is available
-      return !!process.env.OPENROUTER_API_KEY || !!process.env.CLEANAPI_API_KEY;
-    } else if (this.provider === 'cleanapi') {
-      return !!process.env.CLEANAPI_API_KEY;
-    }
-    return false;
+    if (this.provider === 'gemini') return !!process.env.GEMINI_API_KEY;
+    if (this.provider === 'openai') return !!process.env.OPENAI_API_KEY;
+    // CleanAPI / OpenRouter: configured when either one has a key
+    return this.chain().length > 0;
   }
 }
 

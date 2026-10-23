@@ -6,6 +6,10 @@ const { decryptPayload, encryptPayload, decryptFileEnvelope } = require('./vault
 const User = require('../models/User');
 const Document = require('../models/Document');
 const { evaluateEligibility } = require('../controllers/eligibilityController');
+const { requestedFields, limitTo, documentDetailsFor, wantsEverything, DOC_WORDS } = require('./whatsappFields');
+const docFields = require('./documentFields');
+const docKind = require('./whatsappDocKind');
+const { maskSensitiveText } = require('./securityService');
 
 // The WhatsApp assistant as an agent. The model only PLANS: it picks tools and their arguments. Every rule that
 // protects data lives in the tools below (PIN, confirmation, ownership, validation), so a confused or tricked
@@ -22,7 +26,7 @@ const FIELD_LABEL = {
   address: 'Address', pincode: 'PIN code', state: 'State', phone: 'Phone', email: 'Email',
 };
 const SENSITIVE = new Set(['aadhaarNumber', 'panNumber', 'passportNumber', 'drivingLicenseNumber']);
-const TYPE_LABEL = { aadhaar: 'Aadhaar card', pan: 'PAN card', passport: 'Passport', license: 'Driving licence', other: 'Document' };
+const TYPE_LABEL = { aadhaar: 'Aadhaar card', pan: 'PAN card', passport: 'Passport', license: 'Driving licence', voter: 'Voter ID card', vehicle: 'Vehicle registration (RC)', marksheet: 'Marksheet', certificate: 'Certificate', bank: 'Bank document', insurance: 'Insurance document', other: 'Document' };
 
 const spaced = (n) => String(n).replace(/(\d{4})(?=\d)/g, '$1 ');
 const show = (key, value, reveal) => {
@@ -100,13 +104,23 @@ function cleanFields(fields = {}, custom = {}) {
 async function docList(ctx) {
   if (ctx.user.securityVersion === 2) {
     if (!ctx.entry) throw new PinRequired();
-    return ctx.entry.data.docs.map((d) => ({ id: d.id, name: d.name, type: d.type || (d.fields?.aadhaarNumber ? 'aadhaar' : d.fields?.panNumber ? 'pan' : d.fields?.passportNumber ? 'passport' : ''), fields: d.fields || {}, v2: true }));
+    return ctx.entry.data.docs.map((d) => ({ id: d.id, name: d.name, title: d.title || '', type: d.type || (d.fields?.aadhaarNumber ? 'aadhaar' : d.fields?.panNumber ? 'pan' : d.fields?.passportNumber ? 'passport' : ''), fields: d.fields || {}, v2: true }));
   }
-  const rows = await Document.find({ userId: ctx.user._id, securityVersion: { $ne: 2 } }).sort({ uploadedAt: -1 }).limit(50).select('originalName documentType structuredData ocrStatus').lean();
-  return rows.map((d) => ({ id: String(d._id), name: d.originalName, type: d.structuredData?.documentType || (d.documentType !== 'other' ? d.documentType : ''), fields: d.structuredData || {}, status: d.ocrStatus, v2: false }));
+  const rows = await Document.find({ userId: ctx.user._id, securityVersion: { $ne: 2 } }).sort({ uploadedAt: -1 }).limit(50).select('originalName documentType structuredData ocrStatus extractedText').lean();
+  return rows.map((d) => ({ id: String(d._id), name: d.originalName, text: String(d.extractedText || '').slice(0, 2500), title: d.structuredData?.documentTitle || '', type: d.structuredData?.documentType || (d.documentType !== 'other' ? d.documentType : ''), fields: d.structuredData || {}, status: d.ocrStatus, v2: false }));
 }
 
-const TYPE_WORDS = { aadhaar: /aadhaa?r|adhar|uid/i, pan: /\bpan\b/i, passport: /passport/i, license: /licen[cs]e|\bdl\b/i };
+// What a document IS, for a person: "Diploma 2nd semester marksheet", "Aadhaar card". The file name is only a fallback,
+// because a photo saved from WhatsApp is called something like whatsapp-1792749132217.jpg.
+function docLabel(d) {
+  if (d.title && d.title.length > 2) return d.title;
+  const guess = docKind.guessKind({ documentType: d.type, documentTitle: d.title, text: d.text || '' });
+  if (guess) return guess.label;
+  if (TYPE_LABEL[d.type]) return TYPE_LABEL[d.type];
+  return /^whatsapp-\d+\.\w+$/i.test(d.name || '') ? 'Document' : (d.name || 'Document');
+}
+
+const TYPE_WORDS = { aadhaar: /aadhaa?r|adhar|uid/i, pan: /\bpan\b/i, passport: /passport/i, license: /licen[cs]e|\bdl\b/i, voter: /voter|\bepic\b/i, vehicle: /\brc\b|registration certificate|rc book/i, marksheet: /mark\s*-?sheet|statement of marks|grade ?card|report card/i, certificate: /certificate|diploma|degree/i, bank: /pass\s*book|bank/i, insurance: /insurance|policy/i };
 async function resolveDoc(ctx, ref) {
   const list = await docList(ctx);
   if (!list.length) return { error: 'You have no documents stored yet.' };
@@ -116,18 +130,155 @@ async function resolveDoc(ctx, ref) {
     return doc ? { doc } : { error: `There is no document number ${q}. You have ${list.length}.` };
   }
   const lower = q.toLowerCase();
-  let hits = list.filter((d) => d.name.toLowerCase() === lower);
-  if (!hits.length) hits = list.filter((d) => lower && d.name.toLowerCase().includes(lower));
+  let hits = list.filter((d) => d.name.toLowerCase() === lower || docLabel(d).toLowerCase() === lower);
+  if (!hits.length) hits = list.filter((d) => lower && (d.name.toLowerCase().includes(lower) || docLabel(d).toLowerCase().includes(lower)));
   if (!hits.length) {
     const key = Object.keys(TYPE_WORDS).find((k) => TYPE_WORDS[k].test(q));
     if (key) hits = list.filter((d) => d.type === key || TYPE_WORDS[key].test(d.name));
   }
   if (hits.length === 1) return { doc: hits[0] };
   if (!hits.length) return { error: `I could not find a document called "${q}". Say *documents* to see the list.` };
-  return { error: `More than one document matches "${q}":\n${hits.map((d) => `${list.indexOf(d) + 1}. ${d.name}`).join('\n')}\nTell me the number.` };
+  return { error: `More than one document matches "${q}":\n${hits.map((d) => `${list.indexOf(d) + 1}. ${docLabel(d)}`).join('\n')}\nTell me the number.` };
 }
 
 const fieldsText = (fields, reveal) => Object.keys(FIELD_LABEL).filter((k) => fields[k]).map((k) => `${FIELD_LABEL[k]}: ${show(k, fields[k], reveal)}`);
+
+// ---- answering only what was asked -------------------------------------------------------------------------------
+// Documents saved before their own labelled fields were read get them now, once, from the text already stored.
+async function backfillFields(rows, user) {
+  const todo = rows.filter((d) => !d.fieldsExtractedAt && d.extractedText && d.extractedText.length > 20).slice(0, 3);
+  await Promise.all(todo.map(async (d) => {
+    try {
+      const known = d.structuredData || {};
+      const read = await Promise.race([
+        docFields.extractFields({ text: d.extractedText, known, aiService, user, typeLabel: TYPE_LABEL[known.documentType] || '', fileName: d.originalName }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timed out')), 25000)),
+      ]);
+      const assembled = docFields.assembleStructured({ known, fields: read.fields, documentTitle: known.documentTitle || read.documentTitle });
+      const stored = (await docFields.reviewWithAI({ text: d.extractedText, record: assembled, aiService, user })).record;
+      d.structuredData = stored;
+      await Document.updateOne({ _id: d._id }, { $set: { structuredData: stored, fieldsExtractedAt: new Date() } });
+    } catch (error) {
+      console.warn(`[whatsapp] could not read the fields of an older document: ${error.message}`);
+    }
+  }));
+}
+
+// The member's profile first, then what was read from their documents: every field of each, not a fixed list.
+async function profileAndDocs(ctx) {
+  const plain = (fields) => Object.fromEntries(Object.entries(fields || {}).filter(([k, v]) => !docFields.HIDDEN_KEYS.has(k) && typeof v === 'string' && v));
+  if (ctx.user.securityVersion === 2) {
+    return { profile: ctx.entry.data.profile, docs: ctx.entry.data.docs.map((d) => ({ name: d.name, title: d.title || '', type: d.type, fields: plain(d.fields) })), reveal: true };
+  }
+  const u = await User.findById(ctx.user._id).lean();
+  const rows = await Document.find({ userId: ctx.user._id, securityVersion: { $ne: 2 }, ocrStatus: 'completed' }).sort({ uploadedAt: -1 }).limit(8).select('originalName documentType structuredData extractedText fieldsExtractedAt').lean();
+  await backfillFields(rows, ctx.user);
+  return {
+    profile: { fullName: u.name, email: u.email, phone: u.phone, ...(u.extractedData || {}) },
+    docs: rows.map((d) => ({ name: d.originalName, title: d.structuredData?.documentTitle || '', type: d.structuredData?.documentType || d.documentType, fields: plain(d.structuredData) })),
+    reveal: Boolean(ctx.unlocked),
+  };
+}
+
+// "Label: value" lines for every field of a document (the usual ones first, then whatever else it prints).
+function docLines(fields, reveal) {
+  const keys = [...Object.keys(FIELD_LABEL).filter((k) => fields[k]), ...Object.keys(fields).filter((k) => !FIELD_LABEL[k] && !docFields.HIDDEN_KEYS.has(k) && !docFields.ALIAS_KEYS.has(k) && fields[k]).sort()];
+  return keys.map((k) => {
+    const label = FIELD_LABEL[k] ? FIELD_LABEL[k] : docFields.labelOf(k);
+    const sensitive = SENSITIVE.has(k) || docFields.isSensitive(k, label, fields[k]);
+    return `${label}: ${sensitive && !reveal ? docFields.maskValue(fields[k]) : (FIELD_LABEL[k] ? show(k, fields[k], reveal) : fields[k])}`;
+  });
+}
+
+// A question the stored fields cannot answer (a table, a semester, a paragraph) is answered from the document's own text.
+// Standard accounts only: an encrypted account's text is never sent to the AI. The AI gets the text of the one or two documents
+// that best fit the question, with ID numbers masked unless the member has confirmed their PIN, and must answer from that text
+// alone. Any number in its answer has to appear in the document, or the answer is thrown away.
+async function answerFromDocumentText(ctx, question) {
+  if (ctx.user.securityVersion === 2 || !aiService.isConfigured()) return null;
+  const rows = await Document.find({ userId: ctx.user._id, securityVersion: { $ne: 2 }, ocrStatus: 'completed', extractedText: { $exists: true, $ne: '' } })
+    .sort({ uploadedAt: -1 }).limit(8).select('originalName structuredData extractedText').lean();
+  if (!rows.length) return null;
+  const qTokens = new Set(docFields.tokens(question));
+  const scored = rows.map((d, i) => {
+    const head = `${d.structuredData?.documentTitle || ''} ${d.structuredData?.documentType || ''} ${d.originalName} ${String(d.extractedText).slice(0, 2500)}`;
+    const overlap = docFields.tokens(head).filter((t) => qTokens.has(t)).length;
+    return { d, score: overlap * 10 - i }; // newer documents win ties
+  }).sort((a, b) => b.score - a.score).slice(0, 2).map((x) => x.d);
+
+  const clip = (t) => (ctx.unlocked ? t : maskSensitiveText(t)).slice(0, 7000);
+  const body = scored.map((d, i) => `DOCUMENT ${i + 1}: ${d.structuredData?.documentTitle || d.originalName}\n${clip(String(d.extractedText))}`).join('\n\n=====\n\n');
+  const system = `You answer a member's question about their own documents using ONLY the document text given.
+Rules: reply with just the information asked for, short, in plain WhatsApp text (use *bold* for labels, no tables, no emojis). Do not add details that were not asked for. If the document text does not contain the answer, reply with exactly NOT_FOUND. Never guess or calculate beyond what is printed. Copy numbers exactly as printed. Do not write out full Aadhaar, PAN or passport numbers: give only the last 4 characters.`;
+  let reply;
+  try {
+    // A member is waiting in a chat: a firm time budget (about 50 s in all) instead of the long background timeouts.
+    reply = await aiService.chat(system, `${body}\n\nQUESTION: ${String(question).slice(0, 300)}\n\nANSWER:`, { user: { securityVersion: 1 }, operation: aiService.AI_OPERATION.CLASSIFICATION, primaryTimeout: 25000, fallbackTimeout: 25000, retries: 0 });
+  } catch (error) {
+    console.warn(`[whatsapp] could not answer from the document text: ${error.message}`);
+    return null;
+  }
+  const answer = String(reply || '').trim();
+  if (!answer || /\bNOT_FOUND\b/.test(answer)) return null;
+  // every number in the answer must be in the document (or the question): otherwise it is not an answer from the document
+  const haystack = scored.map((d) => String(d.extractedText)).join(' ').replace(/[^0-9A-Za-z./]/g, ' ') + ' ' + question;
+  const digitsOnly = scored.map((d) => String(d.extractedText).replace(/\D/g, '')).join(' ');
+  const numbers = (answer.match(/\d[\d,./]*\d|\d/g) || []).map((n) => n.replace(/[,]/g, '')).filter((n) => n.replace(/\D/g, '').length >= 2);
+  const ungrounded = numbers.filter((n) => !haystack.includes(n) && !digitsOnly.includes(n.replace(/\D/g, '')));
+  if (ungrounded.length) { console.warn('[whatsapp] dropped an answer with numbers that are not in the document'); return null; }
+  return answer.slice(0, 1500);
+}
+
+// "what are my marks of final semester": a question about the member's own data. These go straight to a lookup and are never
+// answered with the list of documents (that is only for when the list itself is asked for).
+const NOT_A_LOOKUP = /\b(documents?|docs|files|list|send|download|delete|remove|erase|save|store|update|change|set|add|rename|forward|share|eligib\w*|apply|fill|form|help|menu|lock|unlink|status|hello|hi)\b/i;
+const LOOKUP_START = /^\s*(?:what|whats|what's|which|when|where|who|how\s+(?:much|many|old|long)|tell me|show me|give me|can you tell me|do i have|is there)\b|\?\s*$/i;
+const isDataQuestion = (text) => LOOKUP_START.test(text) && !NOT_A_LOOKUP.test(text) && /\b(my|mine|me)\b/i.test(text) && !impliedCall(text);
+
+// The label a question names, found in the raw text of the member's documents (no AI): "seat number" -> the number printed after
+// "SEAT NO." even in the middle of a line. Standard accounts only (an encrypted account's text is not readable here).
+async function answerFromTextSearch(ctx, question) {
+  if (ctx.user.securityVersion === 2) return null;
+  const rows = await Document.find({ userId: ctx.user._id, securityVersion: { $ne: 2 }, ocrStatus: 'completed', extractedText: { $exists: true, $ne: '' } })
+    .sort({ uploadedAt: -1 }).limit(8).select('originalName structuredData extractedText').lean();
+  const matches = [];
+  for (const d of rows) {
+    for (const hit of docFields.findInText(question, d.extractedText)) matches.push({ ...hit, doc: { name: d.originalName, title: d.structuredData?.documentTitle || '' } });
+    if (matches.length) break; // the newest document that has it
+  }
+  return matches.length ? docFields.formatMatches(matches, { reveal: Boolean(ctx.unlocked) }) : null;
+}
+
+const NOT_FOUND = 'I could not find that in your documents. Say *documents* to see what I have, or send me the document that has it.';
+
+// Answers a question by finding the fields it asks about, in any of the member's documents, and returns only those.
+// Returns null when nothing matches. Standard accounts may ask the AI which fields a differently worded question means
+// (it sees field labels only, never values); encrypted accounts match locally.
+async function answerAsked(ctx, question, { ai = true } = {}) {
+  const { profile, docs, reveal } = await profileAndDocs(ctx);
+  const profileFields = Object.fromEntries(Object.entries(profile).filter(([k, v]) => FIELD_LABEL[k] && typeof v === 'string' && v));
+  const pool = [...docs, { name: 'Your profile', title: 'Your profile', type: '', fields: profileFields }];
+  let matches = docFields.searchFields(question, pool);
+  if (!matches.length && ai && ctx.user.securityVersion !== 2) matches = await docFields.pickFieldsWithAI(question, pool, aiService, ctx.user);
+  return matches.length ? docFields.formatMatches(matches, { reveal }) : null;
+}
+
+// Only the requested fields, nothing else. A field missing from the profile is looked for in the documents.
+async function answerRequested(ctx, keys, docType = null) {
+  const { profile, docs, reveal } = await profileAndDocs(ctx);
+  const pool = docType ? docs.filter((d) => d.type === docType || (DOC_WORDS[docType] && DOC_WORDS[docType].test(d.name))) : docs;
+  const lines = []; const missing = [];
+  for (const key of keys) {
+    const fromDoc = pool.find((d) => d.fields?.[key]);
+    const value = docType ? fromDoc?.fields?.[key] : (profile[key] || fromDoc?.fields?.[key]);
+    if (value) lines.push(`*${FIELD_LABEL[key]}*: ${show(key, value, reveal)}`); else missing.push(FIELD_LABEL[key].toLowerCase());
+  }
+  const out = [...lines];
+  if (missing.length) out.push(`I do not have your ${missing.join(' or ')}${docType ? ` on your ${TYPE_LABEL[docType] || 'document'}` : ' saved'}. Send a photo of a document that shows it, or tell me and I will save it.`);
+  const masked = !reveal && keys.some((k) => SENSITIVE.has(k) && (profile[k] || pool.some((d) => d.fields?.[k])));
+  if (masked) out.push('The number is masked. Say *full* to see it (I will ask for your PIN).');
+  return out.join('\n');
+}
 
 // ---- the tools -----------------------------------------------------------------------------------------------
 const needsVault = (ctx) => {
@@ -143,17 +294,17 @@ const needsUnlock = (ctx) => { if (!ctx.unlocked) throw new PinRequired(); };
 async function detailsText(ctx) {
   const v2 = ctx.user.securityVersion === 2;
   let profile; let docs;
-  if (v2) { profile = ctx.entry.data.profile; docs = ctx.entry.data.docs.map((d) => ({ name: d.name, type: d.type, fields: d.fields })); }
+  if (v2) { profile = ctx.entry.data.profile; docs = ctx.entry.data.docs.map((d) => ({ name: d.name, title: d.title || '', type: d.type, fields: d.fields })); }
   else {
     const u = await User.findById(ctx.user._id).lean();
     profile = { fullName: u.name, email: u.email, phone: u.phone, ...(u.extractedData || {}) };
-    docs = ctx.unlocked ? (await Document.find({ userId: ctx.user._id, securityVersion: { $ne: 2 }, ocrStatus: 'completed' }).sort({ uploadedAt: -1 }).limit(8).select('originalName structuredData documentType').lean()).map((d) => ({ name: d.originalName, type: d.structuredData?.documentType || d.documentType, fields: d.structuredData || {} })) : [];
+    docs = ctx.unlocked ? (await Document.find({ userId: ctx.user._id, securityVersion: { $ne: 2 }, ocrStatus: 'completed' }).sort({ uploadedAt: -1 }).limit(8).select('originalName structuredData documentType').lean()).map((d) => ({ name: d.originalName, title: d.structuredData?.documentTitle || '', type: d.structuredData?.documentType || d.documentType, fields: d.structuredData || {} })) : [];
   }
   const reveal = v2 || ctx.unlocked;
   const lines = fieldsText(profile, reveal);
   const custom = Object.entries(profile.customFields || {}).map(([k, v]) => `${k}: ${v}`);
   const out = [lines.length || custom.length ? `*Your details*\n${[...lines, ...custom].join('\n')}` : 'I have no details saved for you yet. Tell me, for example, "save my phone number 9876543210", or send a photo of a document.'];
-  docs.forEach((d) => { const rows = fieldsText(d.fields, reveal); if (rows.length) out.push(`*${TYPE_LABEL[d.type] || 'Document'}* (${d.name})\n${rows.join('\n')}`); });
+  docs.forEach((d) => { const rows = docLines(d.fields, reveal); if (rows.length) out.push(`*${d.title || TYPE_LABEL[d.type] || 'Document'}*${/^whatsapp-\d+\.\w+$/i.test(d.name || '') ? '' : ` (${d.name})`}\n${rows.join('\n')}`); });
   if (!reveal && (profile.aadhaarNumber || profile.panNumber)) out.push('Aadhaar and PAN are masked. Say *full* to see them (I will ask for your PIN).');
   return out.join('\n\n');
 }
@@ -165,7 +316,24 @@ const TOOLS = {
     async run(ctx, { question }) {
       const blocked = needsVault(ctx); if (blocked) return blocked;
       const q = String(question || ctx.text);
-      if (/\b(details?|everything|profile|all (?:my )?(?:info|data))\b/i.test(q) && !/\b(documents?|docs)\b.*\b(have|stored|list)\b/i.test(q)) return { text: await detailsText(ctx) };
+      const docType = documentDetailsFor(ctx.text);
+      if (docType) return TOOLS.get_document_details.run(ctx, { document: docType });
+      const asked = limitTo(ctx.text) || limitTo(q);
+      if (asked) return { text: await answerRequested(ctx, asked, requestedFields(ctx.text).doc || requestedFields(q).doc) };
+      // Anything else specific (vehicle class, roll number, marks, account number...) is looked up in the documents' own
+      // fields, whatever they are. Only a request for everything shows everything.
+      if (!wantsEverything(ctx.text) && !wantsEverything(q)) {
+        const found = await answerAsked(ctx, ctx.text || q, { ai: false }) || (q !== ctx.text ? await answerAsked(ctx, q, { ai: false }) : null);
+        if (found) return { text: found };
+        const local = await answerFromTextSearch(ctx, ctx.text || q);
+        if (local) return { text: local };
+        const fromText = await answerFromDocumentText(ctx, ctx.text || q);
+        if (fromText) return { text: fromText };
+        const picked = await answerAsked(ctx, ctx.text || q);
+        if (picked) return { text: picked };
+        return { text: NOT_FOUND };
+      }
+      if (wantsEverything(ctx.text) || wantsEverything(q)) return { text: await detailsText(ctx) };
       if (ctx.user.securityVersion === 2) return { text: ctx.deps.answerFromVault(q, ctx.entry.data) };
       const fresh = await User.findById(ctx.user._id);
       fresh._recentDocuments = await Document.find({ userId: ctx.user._id, ocrStatus: 'completed', extractedText: { $exists: true, $ne: '' } }).sort({ uploadedAt: -1 }).limit(5).select('originalName extractedText structuredData uploadedAt');
@@ -174,11 +342,23 @@ const TOOLS = {
   },
 
   get_profile: {
-    description: "Show the member's saved personal details. Set reveal true when they ask for full or unmasked Aadhaar/PAN (this needs their PIN).",
-    parameters: { type: 'object', properties: { reveal: { type: 'boolean', description: 'true to show Aadhaar, PAN and similar numbers in full' } } },
-    async run(ctx, { reveal }) {
+    description: "Show the member's saved personal details. ALWAYS pass `fields` with only what they asked for (an address question gets ['address'], not the whole profile). Leave `fields` out only when they ask for everything. Set reveal true when they ask for full or unmasked Aadhaar/PAN (this needs their PIN).",
+    parameters: {
+      type: 'object',
+      properties: {
+        fields: { type: 'array', items: { type: 'string', enum: Object.keys(FIELD_LABEL) }, description: 'Only the details asked for, e.g. ["address"] or ["phone","email"]' },
+        reveal: { type: 'boolean', description: 'true to show Aadhaar, PAN and similar numbers in full' },
+      },
+    },
+    async run(ctx, { reveal, fields }) {
       const blocked = needsVault(ctx); if (blocked) return blocked;
       if (reveal) needsUnlock(ctx);
+      // Enforced here, whatever the model passed: a specific question is answered with just that detail.
+      const docType = documentDetailsFor(ctx.text);
+      if (docType) return TOOLS.get_document_details.run(ctx, { document: docType });
+      const asked = limitTo(ctx.text) || (Array.isArray(fields) ? fields.filter((k) => FIELD_LABEL[k]) : []);
+      if (asked.length) return { text: await answerRequested(ctx, asked, requestedFields(ctx.text).doc) };
+      if (!wantsEverything(ctx.text)) return { text: (await answerAsked(ctx, ctx.text, { ai: false })) || (await answerFromDocumentText(ctx, ctx.text)) || (await answerAsked(ctx, ctx.text)) || NOT_FOUND };
       let profile;
       if (ctx.user.securityVersion === 2) profile = ctx.entry.data.profile;
       else {
@@ -237,7 +417,7 @@ const TOOLS = {
       const blocked = needsVault(ctx); if (blocked) return blocked;
       const list = await docList(ctx);
       if (!list.length) return { text: 'You have no documents stored yet. Send me a photo or PDF and I will save it.' };
-      return { text: `*Your documents*\n${list.map((d, i) => `${i + 1}. ${d.name}${d.type ? ` (${TYPE_LABEL[d.type] || 'Document'})` : ''}`).join('\n')}` };
+      return { text: `*Your documents*\n${list.map((d, i) => `${i + 1}. ${docLabel(d)}`).join('\n')}\n\nSay a number or a name to get its details or the file.` };
     },
   },
 
@@ -247,9 +427,22 @@ const TOOLS = {
     async run(ctx, { document }) {
       const blocked = needsVault(ctx); if (blocked) return blocked;
       const r = await resolveDoc(ctx, document); if (r.error) return { text: r.error };
-      const lines = fieldsText(r.doc.fields, ctx.user.securityVersion === 2 ? true : ctx.unlocked);
-      const hint = ctx.user.securityVersion !== 2 && !ctx.unlocked && Object.keys(r.doc.fields).some((k) => SENSITIVE.has(k)) ? '\n\nNumbers are masked. Say *full* to see them (I will ask for your PIN).' : '';
-      return { text: lines.length ? `*${r.doc.name}*\n${lines.join('\n')}${hint}` : `*${r.doc.name}*\nNo details were read from this document.` };
+      const reveal = ctx.user.securityVersion === 2 ? true : ctx.unlocked;
+      const title = r.doc.title || r.doc.name;
+      // A specific question gets just that field of this document: first the usual fields ("name on my Aadhaar"), then
+      // whatever else the document prints ("class of vehicle on my licence").
+      const usual = limitTo(ctx.text);
+      if (usual && !documentDetailsFor(ctx.text)) {
+        const rows = usual.filter((k) => r.doc.fields[k]).map((k) => `${FIELD_LABEL[k]}: ${show(k, r.doc.fields[k], reveal)}`);
+        return { text: rows.length ? `*${title}*\n${rows.join('\n')}` : `I could not find that on *${title}*.` };
+      }
+      if (!documentDetailsFor(ctx.text) && !wantsEverything(ctx.text)) {
+        const only = docFields.searchFields(ctx.text, [{ name: r.doc.name, title: r.doc.title, type: r.doc.type, fields: r.doc.fields }]);
+        if (only.length) return { text: `*${title}*\n${docFields.formatMatches(only, { reveal })}` };
+      }
+      const lines = docLines(r.doc.fields, reveal);
+      const hint = ctx.user.securityVersion !== 2 && !ctx.unlocked && Object.keys(r.doc.fields).some((k) => SENSITIVE.has(k) || docFields.isSensitive(k, docFields.labelOf(k), r.doc.fields[k])) ? '\n\nNumbers are masked. Say *full* to see them (I will ask for your PIN).' : '';
+      return { text: lines.length ? `*${title}*\n${lines.join('\n')}${hint}` : `*${title}*\nNo details were read from this document.` };
     },
   },
 
@@ -400,6 +593,8 @@ const toolDefs = Object.entries(TOOLS).map(([name, t]) => ({ type: 'function', f
 const SYSTEM = (user) => `You are FormOS, an assistant on WhatsApp that helps ${user.securityVersion !== 2 && user.name ? user.name.split(' ')[0] : 'the member'} manage their identity documents and details: save them, find them, send them back, fill forms and check eligibility.
 
 How you work:
+- Never answer a question about the member's own details with the list of their documents. List documents only when they ask for the list.
+- Answer ONLY what was asked. If the member asks for one detail (their address, date of birth, phone...), reply with just that detail, never their whole profile or other fields. Pass only the asked field names to get_profile. Show everything only when they clearly ask for all their details.
 - Act by calling tools. For anything about the member's own data or documents, always call a tool: never answer from memory or guess.
 - Saving data: call update_profile with the values the member gave. Normalise obvious formats but never invent values.
 - Documents are saved when the member sends a photo or PDF, so you do not need a tool for that. If they ask how, tell them to send the file in this chat.
@@ -441,8 +636,16 @@ function documentRef(text) {
   const n = text.match(/\b(?:document|doc|file)\s*(?:no\.?|number|#)?\s*(\d{1,2})\b/i);
   return n ? n[1] : null;
 }
+const wantsDocumentList = (text) => {
+  const t = String(text || '').trim();
+  return t.length < 90
+    && /\b(documents?|docs|files)\b/i.test(t)
+    && /\b(list|show|see|view|display|what|which|all|stored|saved|have)\b|^\W*(my\s+)?(documents?|docs)\W*$/i.test(t)
+    && !/\b(number|details?|info|marks?|address|birth|dob|name on|valid|expir|send|download|delete|remove|rename|get me|give me|share)\b/i.test(t);
+};
+
 function impliedCall(text) {
-  const noun = /\b(card|copy|file|photo|pdf|document|doc|scan|image|picture|passport|licen[cs]e)\b/i.test(text) || /\.(jpe?g|png|pdf)\b/i.test(text);
+  const noun = /\b(card|copy|file|photo|pdf|document|doc|scan|image|picture|passport|licen[cs]e|mark\s*sheet|certificate)\b/i.test(text) || /\.(jpe?g|png|pdf)\b/i.test(text);
   if (!noun) return null;
   const ref = documentRef(text);
   if (!ref) return null;
@@ -464,6 +667,29 @@ async function runTool(name, args, ctx) {
 async function run(ctx) {
   const result = { texts: [], files: [], needsPin: false, used: [] };
   const apply = (out, name) => { if (!out) return; if (out.text) result.texts.push(out.text); if (out.files) result.files.push(...out.files); if (name) result.used.push(name); };
+
+  // "show my documents" is answered by the list itself, so the model never invents one (with file names and made-up statuses).
+  if (wantsDocumentList(ctx.text)) {
+    try {
+      apply(await TOOLS.list_documents.run(ctx, {}), 'list_documents');
+      return result;
+    } catch (error) {
+      if (error instanceof PinRequired) { result.needsPin = true; return result; }
+      console.warn(`[whatsapp] the document list failed, using the planner: ${error.message}`);
+    }
+  }
+
+  // A question about the member's own data is answered by the lookup directly, so the model can never answer it with the
+  // list of documents. If the lookup finds nothing it says so.
+  if (isDataQuestion(ctx.text)) {
+    try {
+      const out = await TOOLS.answer_from_my_data.run(ctx, { question: ctx.text });
+      if (out?.text) { apply(out, 'answer_from_my_data'); return result; }
+    } catch (error) {
+      if (error instanceof PinRequired) { result.needsPin = true; return result; }
+      console.warn(`[whatsapp] the direct lookup failed, using the planner: ${error.message}`);
+    }
+  }
 
   let plan;
   try {

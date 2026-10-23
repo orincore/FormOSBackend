@@ -42,6 +42,7 @@ ${context}
 USER QUESTION: ${userQuestion}
 
 INSTRUCTIONS:
+- Answer ONLY the detail that was asked. If they ask for their address, reply with the address alone; do not list their name, date of birth, numbers or any other detail. List several details only when the question asks for several, or for everything.
 - For questions about the user's own details or documents, answer ONLY from the data above. If it is not there, say "I don't have that information in your stored data" and, when useful, tell them which document to upload.
 - For general questions (how to apply for a document or scheme, what a form field means, which documents are needed, how a process works), answer helpfully from general knowledge in a few short steps, and suggest checking the official website for the latest rules. Never invent facts about the user.
 - Be concise and helpful: this is read on a phone

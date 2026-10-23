@@ -54,7 +54,8 @@ async function openVault(user, pin) {
     } catch { /* an unreadable profile just means fewer details */ }
   }
 
-  const rows = await Document.find({ userId: user._id, securityVersion: 2 }).sort({ uploadedAt: -1 }).limit(30).select('_id encryptedStructuredData uploadedAt').lean();
+  const rows = await Document.find({ userId: user._id, securityVersion: 2 }).sort({ uploadedAt: -1 }).limit(30).select('_id encryptedStructuredData encryptedText uploadedAt').lean();
+  const docFields = require('./documentFields');
   const docs = [];
   for (const row of rows) {
     if (!row.encryptedStructuredData) continue;
@@ -63,7 +64,19 @@ async function openVault(user, pin) {
       if (!data || typeof data !== 'object') continue;
       const fields = {};
       FIELDS.forEach((f) => { if (real(data[f])) fields[f] = data[f]; });
-      docs.push({ id: String(row._id), name: data.documentName || data.originalName || 'Document', type: data.documentType || '', fields });
+      // Everything else the document holds (vehicle class, roll number, marks...) comes with it.
+      Object.entries(data).forEach(([k, v]) => { if (!(k in fields) && !docFields.HIDDEN_KEYS.has(k) && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(k) && typeof v === 'string' && real(v)) fields[k] = v; });
+      // A document saved before fields were read (or by another app version) is read now, in memory, from its own text.
+      if (Object.keys(fields).length <= FIELDS.filter((f) => fields[f]).length && row.encryptedText) {
+        try {
+          const text = await decryptPayload(row.encryptedText, key);
+          if (typeof text === 'string' && text.length > 20) {
+            const extra = await docFields.extractFields({ text, known: fields });
+            Object.entries(extra.fields).forEach(([k, v]) => { if (!(k in fields)) fields[k] = v; });
+          }
+        } catch { /* the stored fields are still used */ }
+      }
+      docs.push({ id: String(row._id), name: data.documentName || data.originalName || 'Document', title: data.documentTitle || '', type: data.documentType || '', fields });
       FIELDS.forEach((f) => { if (!profile[f] && fields[f]) profile[f] = fields[f]; });
     } catch { /* skip a document that cannot be read */ }
   }

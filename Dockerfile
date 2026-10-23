@@ -17,10 +17,9 @@ RUN npm ci --omit=dev
 COPY . .
 
 ENV PUPPETEER_SKIP_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
-    WHATSAPP_SESSION_DIR=/data/whatsapp
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
-RUN mkdir -p uploads /data/whatsapp
+RUN mkdir -p uploads
 
 EXPOSE 5000
 

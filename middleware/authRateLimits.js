@@ -109,8 +109,17 @@ const whatsappVerifyLimiter = buildLimiter({
   message: 'Too many incorrect codes. Please wait a few minutes before trying again.',
 });
 
+// Sending a stored file to the member's own phone needs their PIN. Wrong PINs are counted per account as well
+// (the same lockout as the chat), this only slows a script down.
+const whatsappSendDocLimiter = buildLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: 'Too many send requests. Please wait a few minutes and try again.',
+});
+
 module.exports = {
   whatsappLinkLimiter,
+  whatsappSendDocLimiter,
   whatsappVerifyLimiter,
   adminLimiter,
   adminLoginLimiter,

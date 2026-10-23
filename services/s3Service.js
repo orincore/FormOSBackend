@@ -78,22 +78,27 @@ const locationFor = (key) => (isR2Configured()
   ? `r2://${bucketName()}/${key}`
   : `https://${bucketName()}.s3.${process.env.AWS_REGION || 'us-east-1'}.amazonaws.com/${key}`);
 
-// Store bytes under an exact key.
+// Store bytes under an exact key. A dropped connection or a brief R2 hiccup is retried before giving up.
 const putObject = async (key, body, contentType) => {
   assertS3Configured();
-  try {
-    await s3Client.send(new PutObjectCommand({
-      Bucket: bucketName(),
-      Key: key,
-      Body: body,
-      ContentType: contentType || 'application/octet-stream',
-      ...(isR2Configured() ? {} : { ACL: 'private' }),
-    }));
-    return { location: locationFor(key), key, bucket: bucketName() };
-  } catch (error) {
-    console.error(`${storageProvider().toUpperCase()} upload error:`, error.message);
-    throw new Error('Failed to upload file to storage');
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await s3Client.send(new PutObjectCommand({
+        Bucket: bucketName(),
+        Key: key,
+        Body: body,
+        ContentType: contentType || 'application/octet-stream',
+        ...(isR2Configured() ? {} : { ACL: 'private' }),
+      }));
+      return { location: locationFor(key), key, bucket: bucketName() };
+    } catch (error) {
+      lastError = error;
+      console.error(`${storageProvider().toUpperCase()} upload error (attempt ${attempt}/3):`, error.message);
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+    }
   }
+  throw new Error(`Failed to upload file to storage: ${lastError?.message || 'unknown error'}`);
 };
 
 // Upload a user's file under documents/<userId>/<filename>

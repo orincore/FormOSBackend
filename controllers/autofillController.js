@@ -1,5 +1,6 @@
 const User = require('../models/User');
 const Document = require('../models/Document');
+const { HIDDEN_KEYS, labelOf, isSensitive } = require('../services/documentFields');
 
 exports.getAutofillData = async (req, res) => {
   try {
@@ -23,7 +24,8 @@ exports.getAutofillData = async (req, res) => {
     }
 
     // Query all documents associated with user to aggregate extracted information
-    const docs = await Document.find({ userId: req.userId });
+    // Newest first, so when two documents disagree the more recent one wins.
+    const docs = await Document.find({ userId: req.userId }).sort({ createdAt: -1 });
 
     const aggregated = {};
     for (const doc of docs) {
@@ -53,7 +55,7 @@ exports.getAutofillData = async (req, res) => {
     const nameParts = fullName.trim().split(/\s+/);
     const firstName = aggregated.firstName || user.extractedData?.firstName || nameParts[0] || '';
     const lastName = aggregated.lastName || user.extractedData?.lastName || (nameParts.length > 1 ? nameParts[nameParts.length - 1] : '');
-    const middleName = aggregated.middleName || user.extractedData?.middleName || (nameParts.length > 2 ? nameParts.slice(1, -1).join(' ') : (aggregated.fullName && aggregated.fullName.includes('Kiran') ? 'Kiran' : ''));
+    const middleName = aggregated.middleName || user.extractedData?.middleName || (nameParts.length > 2 ? nameParts.slice(1, -1).join(' ') :'');
 
     const primaryPhone = user.phone || user.extractedData?.phone || aggregated.phone || '';
     const docPhone = aggregated.phone || '';
@@ -68,7 +70,7 @@ exports.getAutofillData = async (req, res) => {
     const city = aggregated.city || user.extractedData?.city || '';
     const district = aggregated.district || aggregated.city || user.extractedData?.district || '';
     const state = aggregated.state || user.extractedData?.state || '';
-    const zipCode = aggregated.zipCode || aggregated.zip || aggregated.postalCode || user.extractedData?.zipCode || '';
+    const zipCode = aggregated.zipCode || aggregated.pincode || aggregated.zip || aggregated.postalCode || user.extractedData?.zipCode || '';
     const gender = aggregated.gender || user.extractedData?.gender || '';
     const nationality = aggregated.nationality || user.extractedData?.nationality || 'Indian';
 
@@ -128,13 +130,29 @@ exports.getAutofillData = async (req, res) => {
       district: district || finalCity,
       state: finalState,
       zipCode: finalZipCode,
+      fatherName: aggregated.fatherName || user.extractedData?.fatherName || '',
       country: 'India',
       aadhaar,
       pan,
       voterId: aggregated.voterId || user.extractedData?.voterId || '',
       passportNumber: aggregated.passportNumber || user.extractedData?.passportNumber || '',
-      drivingLicence: aggregated.drivingLicence || aggregated.license || user.extractedData?.drivingLicence || '',
+      drivingLicence: aggregated.drivingLicenseNumber || aggregated.drivingLicence || aggregated.license || user.extractedData?.drivingLicence || '',
     };
+
+    // Every other labelled field read from the member's documents (roll number, seat number, class of vehicle ...),
+    // so the extension can match a form's own labels instead of only the fixed set above.
+    const fields = [];
+    const seenKeys = new Set();
+    for (const [key, value] of Object.entries(aggregated)) {
+      if (HIDDEN_KEYS.has(key) || seenKeys.has(key)) continue;
+      const text = typeof value === 'string' ? value.trim() : typeof value === 'number' ? String(value) : '';
+      if (!text) continue;
+      const label = labelOf(key);
+      const sensitive = isSensitive(key, label, text);
+      if (sensitive && !includeSensitive) continue;
+      seenKeys.add(key);
+      fields.push({ key, label, value: text });
+    }
 
     let payload;
     if (!includeSensitive) {
@@ -156,12 +174,14 @@ exports.getAutofillData = async (req, res) => {
           zipCode: fullAutofillData.zipCode,
           country: fullAutofillData.country,
         },
+        fields,
         requiresStepUp: true,
         protectedFields: ['email', 'phone', 'dateOfBirth', 'aadhaar', 'pan'],
       };
     } else {
       payload = {
         data: fullAutofillData,
+        fields,
         requiresStepUp: false,
         protectedFields: [],
       };

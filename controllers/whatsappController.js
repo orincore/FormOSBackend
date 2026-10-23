@@ -3,6 +3,9 @@ const User = require('../models/User');
 const WhatsAppOtp = require('../models/WhatsAppOtp');
 const WhatsAppOtpLog = require('../models/WhatsAppOtpLog');
 const wa = require('../services/whatsappService');
+const Document = require('../models/Document');
+const StorageService = require('../services/storageService');
+const { unlockDataKey, decryptFileEnvelope } = require('../services/vaultCrypto');
 
 const OTP_TTL_MS = 10 * 60 * 1000;
 const RESEND_GAP_MS = 60 * 1000;
@@ -45,7 +48,7 @@ exports.getStatus = async (req, res) => {
     const live = pending && pending.expiresAt.getTime() > now ? pending : null;
     res.json({
       success: true,
-      bot: { online: wa.isReady(), number: wa.botNumber() },
+      bot: { online: wa.isReady(), number: wa.botNumber(), ...wa.publicProgress() },
       encrypted: { applies: user?.securityVersion === 2, allowed: user?.whatsapp?.allowEncryptedAccess === true },
       linked: user?.whatsapp?.number ? { number: maskNumber(user.whatsapp.number), verifiedAt: user.whatsapp.verifiedAt } : null,
       pending: live
@@ -215,5 +218,70 @@ exports.setEncryptedAccess = async (req, res) => {
   } catch (error) {
     console.error('WhatsApp encrypted access error:', error);
     res.status(500).json({ success: false, message: 'Could not save that setting. Please try again.' });
+  }
+};
+
+// ─── Send a stored document to the member's own WhatsApp ─────────────────────────────────────────
+const MAX_PIN_FAILS = 5;
+const PIN_LOCK_MS = 15 * 60 * 1000;
+const MAX_FILE_BYTES = 16 * 1024 * 1024;
+
+// Sends one stored file to the number this member verified, after checking their 6-digit PIN.
+// It only ever sends to that number, never to one named in the request. The PIN is never logged or stored.
+exports.sendDocument = async (req, res) => {
+  const fail = (status, code, message, extra = {}) => res.status(status).json({ success: false, code, message, ...extra });
+  try {
+    const { documentId, pin } = req.body || {};
+    if (!documentId || !/^[a-f0-9]{24}$/i.test(String(documentId))) return fail(400, 'BAD_REQUEST', 'Choose a document to send.');
+    if (!/^\d{6}$/.test(String(pin || ''))) return fail(400, 'BAD_PIN_FORMAT', 'Enter your 6-digit PIN.');
+
+    const user = await User.findById(req.userId);
+    if (!user) return fail(404, 'NOT_FOUND', 'Account not found.');
+    if (!user.whatsapp?.number) return fail(409, 'NOT_LINKED', 'Link your WhatsApp number first, then you can send documents to it.');
+    if (!wa.isReady()) return fail(503, 'BOT_OFFLINE', 'The WhatsApp assistant is not connected right now. Try again in a moment.');
+
+    const lockedUntil = user.whatsapp.pinLockedUntil;
+    if (lockedUntil && lockedUntil > new Date()) {
+      return fail(429, 'PIN_LOCKED', `Too many wrong PINs. Try again in ${Math.ceil((lockedUntil - Date.now()) / 60000)} minutes.`);
+    }
+
+    if (!(await user.comparePin(String(pin)))) {
+      const after = await User.findOneAndUpdate({ _id: user._id }, { $inc: { 'whatsapp.pinFailures': 1 } }, { new: true });
+      const failures = after?.whatsapp?.pinFailures || 1;
+      if (failures >= MAX_PIN_FAILS) {
+        await User.updateOne({ _id: user._id }, { $set: { 'whatsapp.pinFailures': 0, 'whatsapp.pinLockedUntil': new Date(Date.now() + PIN_LOCK_MS) } });
+        return fail(429, 'PIN_LOCKED', 'Too many wrong PINs. Sending is locked for 15 minutes.');
+      }
+      const left = MAX_PIN_FAILS - failures;
+      return fail(401, 'BAD_PIN', `That PIN is not right. ${left} ${left === 1 ? 'try' : 'tries'} left.`);
+    }
+    if (user.whatsapp.pinFailures) await User.updateOne({ _id: user._id }, { $set: { 'whatsapp.pinFailures': 0 } });
+
+    const row = await Document.findOne({ _id: documentId, userId: req.userId });
+    if (!row) return fail(404, 'NOT_FOUND', 'That document was not found.');
+
+    const stored = await StorageService.downloadFile(row);
+    let file;
+    if (row.securityVersion === 2) {
+      // Encrypted documents can only be opened here if the member agreed to it for the assistant.
+      if (!user.whatsapp.allowEncryptedAccess) {
+        return fail(403, 'ENCRYPTED_OFF', 'This document is encrypted on your device. Turn on encrypted access on the WhatsApp page to let FormOS send it.');
+      }
+      let key;
+      try { key = await unlockDataKey(user, String(pin)); } catch { return fail(401, 'BAD_PIN', 'That PIN did not open your vault.'); }
+      const opened = await decryptFileEnvelope(stored, key);
+      file = { buffer: Buffer.from(opened.bytes), mimeType: opened.mimeType || row.mimeType, filename: opened.filename || 'document' };
+    } else {
+      file = { buffer: stored, mimeType: row.mimeType, filename: row.originalName };
+    }
+    if (file.buffer.length > MAX_FILE_BYTES) return fail(413, 'TOO_LARGE', 'That file is too large to send on WhatsApp. Download it instead.');
+
+    await wa.sendMedia(user.whatsapp.number, file, file.filename);
+    return res.json({ success: true, message: 'Sent. Check your WhatsApp.', number: maskNumber(user.whatsapp.number) });
+  } catch (error) {
+    if (error.code === 'BOT_OFFLINE') return res.status(503).json({ success: false, code: 'BOT_OFFLINE', message: error.message });
+    if (error.code === 'NOT_ON_WHATSAPP') return res.status(422).json({ success: false, code: 'NOT_ON_WHATSAPP', message: error.message });
+    console.error('WhatsApp send document error:', error.message);
+    return res.status(500).json({ success: false, message: 'The document could not be sent. Try again.' });
   }
 };

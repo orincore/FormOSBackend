@@ -3,8 +3,164 @@ const path = require('path');
 const fs = require('fs').promises;
 const pdfParse = require('pdf-parse');
 const { fromPath } = require('pdf2pic');
+const sharp = require('sharp');
+
+// Text is read on this server only (nothing is sent to a cloud OCR service), so documents that must stay private
+// can use it too. The main reader is PaddleOCR (PP-OCR models on ONNX), far more accurate than Tesseract on phone
+// photos, skewed or low-contrast cards. Tesseract on a cleaned-up copy is the backup and a second opinion.
+const MIN_PADDLE_CONFIDENCE = 0.75;
+let paddlePromise = null;
+let paddleQueue = Promise.resolve(); // one image at a time: the engine instance is not safe for parallel use
+
+const loadPaddle = () => {
+  if (!paddlePromise) {
+    paddlePromise = import('@gutenye/ocr-node')
+      .then((mod) => (mod.default || mod).create())
+      .catch((error) => { paddlePromise = null; console.error('PaddleOCR could not start, using Tesseract only:', error.message); return null; });
+  }
+  return paddlePromise;
+};
 
 class OCRService {
+  // Straightens (EXIF), enlarges small photos, stretches contrast. Returns RGBA pixels for PaddleOCR and a
+  // sharpened greyscale PNG for Tesseract.
+  async prepareImage(buffer, angle = 0) {
+    let base = sharp(buffer, { failOn: 'none' }).rotate();
+    if (angle) base = sharp(await base.png().toBuffer()).rotate(angle);
+    const { width = 0 } = await base.clone().metadata();
+    const target = width < 1600 ? 1800 : Math.min(width, 3200);
+    const sized = base.resize({ width: target, withoutEnlargement: false }).normalize();
+    const raw = await sized.clone().ensureAlpha(1).raw().toBuffer({ resolveWithObject: true });
+    const grey = await sized.clone().grayscale().sharpen().png().toBuffer();
+    return { pixels: { data: raw.data, width: raw.info.width, height: raw.info.height }, grey };
+  }
+
+  // Joins the detected pieces into lines, top to bottom and left to right, the way the card reads.
+  linesFromPaddle(texts) {
+    const items = texts
+      .filter((t) => t.text && t.text.trim())
+      .map((t) => {
+        const ys = t.box.map((p) => p[1]); const xs = t.box.map((p) => p[0]);
+        return { text: t.text.trim(), top: Math.min(...ys), bottom: Math.max(...ys), left: Math.min(...xs), right: Math.max(...xs), mean: t.mean || 0 };
+      })
+      .sort((a, b) => a.top - b.top);
+    const rows = [];
+    for (const item of items) {
+      const row = rows.find((r) => Math.abs((r.top + r.bottom) / 2 - (item.top + item.bottom) / 2) < (item.bottom - item.top) * 0.5);
+      if (row) { row.items.push(item); row.top = Math.min(row.top, item.top); row.bottom = Math.max(row.bottom, item.bottom); } else rows.push({ top: item.top, bottom: item.bottom, items: [item] });
+    }
+    const confidence = items.length ? items.reduce((sum, i) => sum + i.mean, 0) / items.length : 0;
+    // How much confidently-read text there is: used to pick the right orientation of a sideways photo.
+    const score = items.reduce((sum, i) => sum + (i.mean >= 0.8 ? i.text.replace(/[^A-Za-z0-9]/g, '').length * i.mean : 0), 0);
+    rows.forEach((r) => r.items.sort((a, b) => a.left - b.left));
+    return { score, text: rows.map((r) => r.items.map((i) => i.text).join(' ')).join('\n'), confidence, items: rows.flatMap((r) => r.items), rows: rows.map((r) => r.items) };
+  }
+
+  async paddleRead(pixels) {
+    const run = async () => {
+      const engine = await loadPaddle();
+      if (!engine) return { text: '', confidence: 0, score: 0 };
+      const result = await engine.detect(pixels);
+      return this.linesFromPaddle(result.texts || []);
+    };
+    const job = paddleQueue.then(run, run);
+    paddleQueue = job.catch(() => {});
+    return job;
+  }
+
+  // Reads one image from memory and keeps where each piece of text sits on the page (the layout tells a label from its
+  // value: the value is right of it or under it). Never throws. Returns { text, items } with items = [] when unavailable.
+  async readImage(buffer) {
+    let prepared;
+    try { prepared = await this.prepareImage(buffer); } catch (error) { console.error('Image preparation failed, reading it as is:', error.message); }
+
+    let paddle = { text: '', confidence: 0, score: 0 };
+    if (prepared) {
+      try { paddle = await this.paddleRead(prepared.pixels); } catch (error) { console.error('PaddleOCR error:', error.message); }
+      // A photo taken sideways reads as garbage with low confidence: try the other turns. PaddleOCR reads upside-down
+      // text almost as well as upright, so orientations that score about the same are told apart by Tesseract,
+      // which only reads upright text.
+      if (paddle.confidence < 0.85) {
+        const options = [{ paddle, prepared }];
+        for (const angle of [90, 180, 270]) {
+          try {
+            const turned = await this.prepareImage(buffer, angle);
+            options.push({ paddle: await this.paddleRead(turned.pixels), prepared: turned });
+          } catch (error) { console.error(`PaddleOCR turn ${angle} failed:`, error.message); }
+        }
+        const top = Math.max(...options.map((o) => o.paddle.score));
+        const close = options.filter((o) => o.paddle.score >= top * 0.8 && o.paddle.score > 0);
+        if (close.length > 1) {
+          for (const option of close) {
+            try { option.upright = (await Tesseract.recognize(option.prepared.grey, 'eng')).data.confidence || 0; } catch { option.upright = 0; }
+          }
+          close.sort((x, y) => y.upright - x.upright);
+        } else close.sort((x, y) => y.paddle.score - x.paddle.score);
+        if (close.length && close[0].paddle.score > paddle.score * 1.3) ({ paddle, prepared } = close[0]);
+      }
+    }
+
+    let tess = '';
+    try { tess = (await Tesseract.recognize(prepared ? prepared.grey : buffer, 'eng')).data.text || ''; } catch (error) { console.error('Tesseract error:', error.message); }
+    if (!paddle.text) return { text: tess, items: [] };
+
+    // PaddleOCR often drops the space between words ("CHAWLATARUNPRAKASH"). Tesseract keeps them, so wherever it read
+    // the same letters, its spacing is used.
+    const alnum = (v) => v.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const tessLines = tess.split('\n').map((l) => l.trim()).filter(Boolean).map((line) => ({ line, flat: alnum(line) }));
+    const respace = (fragment) => {
+      const flat = alnum(fragment);
+      if (flat.length < 6) return fragment;
+      const spacesIn = (fragment.match(/\s/g) || []).length;
+      for (const { line, flat: lineFlat } of tessLines) {
+        const at = lineFlat.indexOf(flat);
+        if (at === -1) continue;
+        // walk the Tesseract line, keeping its spaces, over exactly the characters of this fragment
+        let seen = 0; let out = ''; let started = false;
+        for (const ch of line) {
+          const isAlnum = /[A-Za-z0-9]/.test(ch);
+          if (isAlnum) { if (seen === at) started = true; if (started && seen < at + flat.length) out += ch; seen += isAlnum ? 1 : 0; }
+          else if (started && seen < at + flat.length) out += ch;
+          if (started && seen >= at + flat.length) break;
+        }
+        out = out.trim().replace(/\s+/g, ' ');
+        if ((out.match(/\s/g) || []).length > spacesIn) return out;
+        break;
+      }
+      return fragment.replace(/([a-z])([A-Z])/g, '$1 $2');
+    };
+    (paddle.items || []).forEach((item) => { item.text = respace(item.text); });
+    if (paddle.rows) paddle.text = paddle.rows.map((row) => row.map((i) => i.text).join(' ')).join('\n');
+    else paddle.text = paddle.text.replace(/([a-z])([A-Z])/g, '$1 $2');
+    const items = paddle.items || [];
+
+    // The two readers slip on different characters, so lines only Tesseract found are added after PaddleOCR's.
+    // A confident PaddleOCR read keeps its own lines first, which is where the field patterns look first.
+    const norm = (v) => v.toLowerCase().replace(/[^a-z0-9+]/g, ''); // a blood group's + sign must count
+    const have = norm(paddle.text);
+    const extra = tess.split('\n').map((l) => l.trim()).filter((l) => norm(l).length >= 4 && !have.includes(norm(l)));
+    return { text: paddle.confidence >= MIN_PADDLE_CONFIDENCE && !extra.length ? paddle.text : [paddle.text, ...extra].join('\n'), items };
+  }
+
+  async recognizeImage(buffer) {
+    return (await this.readImage(buffer)).text;
+  }
+
+  // Text plus layout for a file on disk (images keep their layout; a PDF has text only).
+  async extractTextAndItems(filePath) {
+    if (path.extname(filePath).toLowerCase() === '.pdf') return { text: await this.extractText(filePath), items: [] };
+    try { return await this.readImage(await fs.readFile(filePath)); } catch (error) {
+      console.error('OCR extraction error:', error);
+      throw new Error('Failed to extract text from document');
+    }
+  }
+
+  // The same for an image held in memory (encrypted accounts: nothing is written to disk).
+  async readBuffer(buffer, mimeType) {
+    if (mimeType === 'application/pdf') return { text: await this.extractTextFromBuffer(buffer, mimeType), items: [] };
+    try { return await this.readImage(buffer); } catch (error) { console.error('In-memory OCR error:', error.message); return { text: '', items: [] }; }
+  }
+
   async extractText(filePath) {
     try {
       const ext = path.extname(filePath).toLowerCase();
@@ -12,7 +168,7 @@ class OCRService {
       if (ext === '.pdf') {
         return await this.extractTextFromPDF(filePath);
       } else {
-        return await this.extractTextFromImage(filePath);
+        return await this.recognizeImage(await fs.readFile(filePath));
       }
     } catch (error) {
       console.error('OCR extraction error:', error);
@@ -28,8 +184,7 @@ class OCRService {
         const parsed = await pdfParse(buffer);
         return (parsed.text || '').trim().length > 30 ? parsed.text : '';
       }
-      const result = await Tesseract.recognize(buffer, 'eng');
-      return result.data.text || '';
+      return await this.recognizeImage(buffer);
     } catch (error) {
       console.error('In-memory OCR error:', error.message);
       return '';
@@ -92,8 +247,7 @@ class OCRService {
           const pageImage = await convert(i, { responseType: 'image' });
           
           if (pageImage && pageImage.path) {
-            const result = await Tesseract.recognize(pageImage.path, 'eng');
-            allText += result.data.text + '\n\n';
+            allText += (await this.recognizeImage(await fs.readFile(pageImage.path))) + '\n\n';
             
             // Clean up temporary image
             await fs.unlink(pageImage.path).catch(() => {});
@@ -126,6 +280,7 @@ class OCRService {
     const t = text.toUpperCase();
     if (/INCOME TAX DEPARTMENT|PERMANENT ACCOUNT NUMBER/.test(t) || /\b[A-Z]{5}\d{4}[A-Z]\b/.test(t) && !/AADHAAR|UIDAI/.test(t)) return 'pan';
     if (/AADHAAR|UIDAI|UNIQUE IDENTIFICATION|आधार/.test(t)) return 'aadhaar';
+    for (const m of t.matchAll(/\b([2-9]\d{3})\s?(\d{4})\s?(\d{4})\b/g)) if (this.isValidAadhaar(m[1] + m[2] + m[3])) return 'aadhaar';
     if (/REPUBLIC OF INDIA/.test(t) && /PASSPORT/.test(t)) return 'passport';
     if (/DRIVING LICEN[CS]E|UNION OF INDIA.*LICEN/.test(t)) return 'license';
     if (/ELECTION COMMISSION|ELECTOR/.test(t)) return 'voter';
@@ -145,12 +300,29 @@ class OCRService {
     return `${dd.padStart(2, '0')}/${mm.padStart(2, '0')}/${yyyy}`;
   }
 
+  // OCR confuses look-alike characters (O/0, I/1, S/5, B/8). A token is only rewritten when the fixed version
+  // fits the ID's own format, and for Aadhaar when it also passes the check digit, so real numbers are never altered.
+  repairIdNumbers(text) {
+    const toDigits = (v) => v.replace(/[Oo]/g, '0').replace(/[Il|]/g, '1').replace(/S/g, '5').replace(/B/g, '8');
+    const toLetters = (v) => v.replace(/0/g, 'O').replace(/1/g, 'I').replace(/5/g, 'S').replace(/8/g, 'B');
+    let out = text.replace(/\b([0-9OoIl|SB]{4})\s?([0-9OoIl|SB]{4})\s?([0-9OoIl|SB]{4})\b/g, (whole, a, b, c) => {
+      if (/^\d{4}$/.test(a) && /^\d{4}$/.test(b) && /^\d{4}$/.test(c)) return whole;
+      const fixed = toDigits(a + b + c);
+      return this.isValidAadhaar(fixed) ? `${fixed.slice(0, 4)} ${fixed.slice(4, 8)} ${fixed.slice(8)}` : whole;
+    });
+    out = out.replace(/\b([A-Z0158]{5})([0-9OIlSB]{4})([A-Z01580])\b/g, (whole, a, b, c) => {
+      const fixed = `${toLetters(a)}${toDigits(b)}${toLetters(c)}`;
+      return /^[A-Z]{5}\d{4}[A-Z]$/.test(fixed) && /^[A-Z]{3}[ABCFGHLJPT]/.test(fixed) ? fixed : whole;
+    });
+    return out;
+  }
+
   parseStructuredData(text) {
     const data = {};
     if (!text || text.length < 10 || /processing failed|Failed to extract|No text could be extracted/i.test(text)) {
       return data;
     }
-    const flat = text.replace(/[ \t]+/g, ' ');
+    const flat = this.repairIdNumbers(text.replace(/[ \t]+/g, ' '));
 
     const type = this.detectDocumentType(flat);
     if (type !== 'other') data.documentType = type;
@@ -205,14 +377,20 @@ class OCRService {
     const phone = flat.match(/(?:Phone|Mobile|Mob|Tel)\.?\s*(?:No\.?)?\s*[:\-]?\s*(\+?91[\s-]?)?([6-9]\d{9})\b/i);
     if (phone) data.phone = phone[2];
 
-    const email = flat.match(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/);
-    if (email) data.email = email[0];
+    // The first email that is the holder's: the helpdesk address printed on a card (help@uidai.gov.in) is not.
+    const email = (flat.match(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g) || []).find((e) => !/@(?:[\w-]+\.)*(?:gov|nic)\.in$|uidai|incometax|passportindia|parivahan/i.test(e));
+    if (email) data.email = email;
 
     const pin = flat.match(/\b([1-9]\d{5})\b(?!\d)/);
     const clean = (a) => a.replace(/\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b/g, '').replace(/VID\s*:?\s*\d[\d\s]*/gi, '')
       .replace(/Details\s+as\s+on:?\s*[\d\/-]*/gi, '').replace(/\s{2,}/g, ' ').replace(/^[\s,:-]+|[\s,:-]+$/g, '');
     const addr = flat.match(/Address\s*[:\-]?\s*([\s\S]+?)(?=\n\s*\n|\bVID\b|\bAadhaar\b|\bDOB\b|\bDate of\b|$)/i);
-    if (addr && clean(addr[1]).length > 8) data.address = clean(addr[1]).replace(/\n/g, ', ');
+    // At most three lines, stopping at the next label ("Sex: Male", "Father's Name") or a heading, so a blank or
+    // crowded form does not turn the whole page into an address.
+    const addrLines = addr ? addr[1].split('\n').map((l) => l.trim()).filter(Boolean) : [];
+    const stop = addrLines.findIndex((l, i) => i > 0 && (/[:：]/.test(l) || /\b(sex|gender|father|mother|signature|officer|date|dob|card|elector|identity|commission|government)\b/i.test(l)));
+    const addrText = (stop === -1 ? addrLines : addrLines.slice(0, stop)).slice(0, 3).join('\n');
+    if (addrText && clean(addrText).length > 8 && clean(addrText).length <= 250) data.address = clean(addrText).replace(/\n/g, ', ');
     else if (type === 'aadhaar' && pin) {
       const around = flat.slice(Math.max(0, flat.indexOf(pin[1]) - 160), flat.indexOf(pin[1]) + 6);
       const start = around.search(/\b(?:S\/O|D\/O|W\/O|C\/O|House|Flat|Plot|H\.?No)\b/i);

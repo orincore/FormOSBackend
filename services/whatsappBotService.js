@@ -1,5 +1,9 @@
 const User = require('../models/User');
 const Document = require('../models/Document');
+const { serializedId } = require('./whatsappPatches');
+const { limitTo, documentDetailsFor, requestedFields, wantsEverything } = require('./whatsappFields');
+const docFields = require('./documentFields');
+const docKind = require('./whatsappDocKind');
 const ragService = require('./ragService');
 const aiService = require('./aiService');
 const { savePlainDocument } = require('../controllers/documentController');
@@ -10,13 +14,31 @@ const StorageService = require('./storageService');
 const ocrService = require('./ocrService');
 
 const MAX_FILE_BYTES = parseInt(process.env.MAX_FILE_SIZE, 10) || 10 * 1024 * 1024;
-const FILE_TYPES = ['image/jpeg', 'image/png', 'application/pdf'];
+// Any file is stored as sent. Only these are read for details (OCR); the rest are kept and can be sent back.
+const OCR_TYPES = ['image/jpeg', 'image/png', 'application/pdf'];
+const EXT_BY_MIME = {
+  'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/heic': 'heic', 'image/heif': 'heif', 'image/gif': 'gif',
+  'application/pdf': 'pdf', 'application/msword': 'doc', 'text/plain': 'txt',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+};
+const MIME_BY_EXT = { jpg: 'image/jpeg', jpeg: 'image/jpeg', jpe: 'image/jpeg', png: 'image/png', webp: 'image/webp', heic: 'image/heic', heif: 'image/heif', gif: 'image/gif', pdf: 'application/pdf', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', txt: 'text/plain' };
+
+// The type WhatsApp reports is unreliable (image/jpg, octet-stream, none), so the file's own first bytes decide.
+function sniffMime(buffer) {
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (buffer.length >= 5 && buffer.subarray(0, 5).toString('latin1') === '%PDF-') return 'application/pdf';
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString('latin1') === 'RIFF' && buffer.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
+  if (buffer.length >= 12 && buffer.subarray(4, 8).toString('latin1') === 'ftyp' && /^(heic|heix|mif1|msf1|heif)/.test(buffer.subarray(8, 12).toString('latin1'))) return 'image/heic';
+  return null;
+}
 const MAX_REPLY = 3800;
 const PER_MINUTE = 15;
 const READ_WAIT_MS = 45000;
 const STALE_MESSAGE_S = 120;
 
-const TYPE_LABEL = { aadhaar: 'Aadhaar card', pan: 'PAN card', passport: 'Passport', license: 'Driving licence', other: 'Document' };
+const TYPE_LABEL = { aadhaar: 'Aadhaar card', pan: 'PAN card', passport: 'Passport', license: 'Driving licence', marriage: 'Marriage certificate', birth: 'Birth certificate', voter: 'Voter ID card', vehicle: 'Vehicle registration (RC)', marksheet: 'Marksheet', certificate: 'Certificate', bank: 'Bank document', insurance: 'Insurance document', other: 'Document' };
 
 const HELP = `*FormOS assistant*
 Just tell me what you want, in your own words. For example:
@@ -75,6 +97,8 @@ const unlockEnds = () => (UNLOCK_MINUTES > 0 ? Date.now() + UNLOCK_MINUTES * 60 
 const MAX_PIN_FAILS = 5;
 const PIN_LOCK_MS = 15 * 60 * 1000;
 const awaitingPin = new Map(); // userId -> { question, expiresAt }
+const awaitingKind = new Map(); // userId -> { documentId, v2, guess, awaiting: 'confirm' | 'type', expiresAt }: an upload whose kind was asked about
+const KIND_WAIT_MS = 10 * 60 * 1000;
 const revealUntil = new Map(); // userId -> time the unmasked window ends
 const vaults = new Map(); // userId -> { data: { profile, docs }, until }: a Security V2 vault opened with the PIN, in memory only
 const lastQuestion = new Map(); // userId -> { text, at }, so a bare "full" knows what to show
@@ -150,8 +174,26 @@ const SPECIFIC = [
 // Answers from an opened vault without any cloud AI: the decrypted data never leaves this process.
 function answerFromVault(text, vault) {
   const { profile, docs } = vault;
+  // A specific question gets only that detail (read from the profile, or from the document named).
+  const asked = limitTo(text);
+  if (asked && !documentDetailsFor(text)) {
+    const { doc } = requestedFields(text);
+    const pool = doc ? docs.filter((d) => d.type === doc) : docs;
+    const rows = []; const missing = [];
+    for (const key of asked) {
+      const value = (doc ? null : profile[key]) || pool.find((d) => d.fields?.[key])?.fields?.[key];
+      if (value) rows.push(`*${FIELD_LABEL[key]}*: ${formatField(key, value)}`); else missing.push(FIELD_LABEL[key].toLowerCase());
+    }
+    return [...rows, ...(missing.length ? [`I do not have your ${missing.join(' or ')} in your vault.`] : [])].join('\n');
+  }
   for (const [pattern, key] of SPECIFIC) {
     if (pattern.test(text)) return profile[key] ? `*${FIELD_LABEL[key]}*: ${formatField(key, profile[key])}` : `I do not have your ${FIELD_LABEL[key].toLowerCase()} in your vault.`;
+  }
+  // Anything else specific is looked up in the documents' own fields (any labels they print), locally.
+  if (!wantsEverything(text)) {
+    const pool = [...docs.map((d) => ({ name: d.name, title: d.title || '', type: d.type, fields: d.fields || {} })), { name: 'Your profile', title: 'Your profile', type: '', fields: Object.fromEntries(Object.entries(profile).filter(([k, v]) => FIELD_LABEL[k] && typeof v === 'string' && v)) }];
+    const found = docFields.searchFields(text, pool);
+    if (found.length) return docFields.formatMatches(found, { reveal: true });
   }
   const direct = ragService.getDirectAnswer(text, { name: profile.fullName, email: profile.email, phone: profile.phone, extractedData: profile, securityVersion: 1 }, { reveal: true });
   const wantsAll = /\b(details?|everything|profile|info\w*|all)\b/i.test(text);
@@ -236,7 +278,7 @@ async function fetchMedia(msg, wa) {
   let lastError = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const target = attempt === 1 ? msg : (await wa?.client?.getMessageById?.(msg.id?._serialized).catch(() => null)) || msg;
+      const target = attempt === 1 ? msg : (await wa?.client?.getMessageById?.(serializedId(msg.id)).catch(() => null)) || msg;
       const media = await target.downloadMedia();
       if (media && media.data) return media;
       lastError = new Error('WhatsApp returned no file data');
@@ -261,24 +303,43 @@ async function readMedia(msg, wa) {
     return null;
   }
   const buffer = Buffer.from(media.data, 'base64');
-  const mimeType = String(media.mimetype || '').split(';')[0];
-  if (!FILE_TYPES.includes(mimeType)) { await msg.reply('I can only save photos (JPG or PNG) and PDF files.'); return null; }
+  if (!buffer.length) { await msg.reply('That file arrived empty. Please send it again.'); return null; }
   if (buffer.length > MAX_FILE_BYTES) { await msg.reply(`That file is larger than ${Math.round(MAX_FILE_BYTES / 1048576)} MB. Please send a smaller one.`); return null; }
-  const ext = mimeType === 'application/pdf' ? 'pdf' : mimeType === 'image/png' ? 'png' : 'jpg';
-  const originalName = (media.filename || `whatsapp-${Date.now()}.${ext}`).replace(/[^\w.\- ]/g, '_').slice(0, 120);
-  return { buffer, mimeType, originalName };
+  const reported = String(media.mimetype || '').split(';')[0].trim().toLowerCase().replace('image/jpg', 'image/jpeg');
+  const nameExt = String(media.filename || '').split('.').pop().toLowerCase();
+  const generic = !reported || reported === 'application/octet-stream';
+  const mimeType = sniffMime(buffer) || (generic ? MIME_BY_EXT[nameExt] : reported) || 'application/octet-stream';
+  const ext = EXT_BY_MIME[mimeType] || (/^[a-z0-9]{1,5}$/.test(nameExt) && media.filename ? nameExt : 'bin');
+  const base = (media.filename || `whatsapp-${Date.now()}.${ext}`).replace(/[^\w.\- ]/g, '_').slice(0, 120);
+  const originalName = base.toLowerCase().endsWith(`.${ext}`) ? base : `${base}.${ext}`;
+  return { buffer, mimeType, originalName, ocr: OCR_TYPES.includes(mimeType) };
 }
 
 // Saves a file for a Security V2 member: it is read in memory, encrypted with their own vault key in the same
 // format the app uses, and only the encrypted copy is stored (in R2). Nothing readable touches the disk, and the
 // text read from it is never sent to the cloud AI.
 async function saveEncryptedMedia(msg, user, entry, file) {
-  await msg.reply('Got it. Reading your document and encrypting it into your vault now, this takes a few seconds.');
-  const text = await ocrService.extractTextFromBuffer(file.buffer, file.mimeType);
-  const found = text ? ocrService.parseStructuredData(text) : {};
+  await msg.reply(file.ocr
+    ? 'Got it. Encrypting your document into your vault and reading it now, this takes a few seconds.'
+    : 'Got it. Encrypting your file into your vault now.');
 
+  // The file is encrypted and stored first, so a failure while reading it can never lose it.
   const envelope = await encryptFileEnvelope(file.buffer, entry.key, entry.salt, file.originalName, file.mimeType);
   const stored = await StorageService.uploadEncrypted(envelope, file.mimeType, user._id);
+  let text = '';
+  let found = {};
+  if (file.ocr) {
+    try {
+      // Local reader only: the document's text never leaves this server. The page layout gives the other fields too.
+      const read = await ocrService.readBuffer(file.buffer, file.mimeType);
+      text = read.text;
+      found = text ? ocrService.parseStructuredData(text) : {};
+      const extra = await docFields.extractFields({ text, items: read.items, known: found, typeLabel: TYPE_LABEL[found.documentType] || '', fileName: file.originalName });
+      found = docFields.assembleStructured({ known: found, fields: extra.fields, documentTitle: extra.documentTitle });
+    } catch (error) {
+      console.error(`[whatsapp] could not read a saved file (${error?.message}); it is stored anyway`);
+    }
+  }
   const metadata = { ...found, documentName: file.originalName, originalName: file.originalName, fileSize: `${(file.buffer.length / 1024).toFixed(1)} KB`, securityLevel: 'V2 Client-Side Encrypted' };
   let created;
   try {
@@ -307,12 +368,85 @@ async function saveEncryptedMedia(msg, user, entry, file) {
   // The open vault learns about the new document right away.
   const fields = {};
   Object.keys(FIELD_LABEL).forEach((k) => { if (found[k]) fields[k] = found[k]; });
-  entry.data.docs.unshift({ id: String(created._id), name: file.originalName, type: found.documentType || '', fields });
+  const allFields = Object.fromEntries(Object.entries(found).filter(([k, v]) => !docFields.HIDDEN_KEYS.has(k) && typeof v === 'string' && v));
+  entry.data.docs.unshift({ id: String(created._id), name: file.originalName, title: found.documentTitle || '', type: found.documentType || '', fields: { ...fields, ...allFields } });
   Object.keys(fields).forEach((k) => { if (!entry.data.profile[k]) entry.data.profile[k] = fields[k]; });
 
   const rows = [['Type', TYPE_LABEL[found.documentType]], ...Object.keys(FIELD_LABEL).filter((k) => found[k]).map((k) => [FIELD_LABEL[k], formatField(k, found[k])])].filter(([, v]) => v);
-  if (!rows.length) return 'Saved and encrypted in your vault. I could not read any details from it. A clearer photo usually works better.';
-  return `Saved and encrypted in your vault. Here is what I read:\n\n${rows.map(([k, v]) => `*${k}*: ${v}`).join('\n')}\n\nIf something is wrong, you can correct it in the app under Documents.`;
+  const guess = docKind.guessKind({ documentType: found.documentType, documentTitle: found.documentTitle, text });
+  const question = askKind(user._id, created._id, true, file.ocr ? guess : null);
+  if (!file.ocr) return `Saved *${file.originalName}* and encrypted it in your vault. Ask me to send it back any time.\n\n${question}`;
+  if (!rows.length) return `Saved and encrypted in your vault. I could not read any details from it, but the file is safe and you can ask me to send it back. A clearer photo usually reads better.\n\n${question}`;
+  return `Saved${guess ? ` as a *${guess.label}*` : ''} and encrypted in your vault. Here is what I read:\n\n${rows.map(([k, v]) => `*${k}*: ${v}`).join('\n')}\n\nIf a detail is wrong, you can correct it in the app under Documents.\n\n${question}`;
+}
+
+// ---- confirming what kind of document an upload is -----------------------------------------------------------------
+// After a file is saved the assistant says what it thinks it is and asks the member to confirm; their answer ("yes", "no",
+// "it is my PAN card") sets the type. Without an answer the guess simply stays.
+function askKind(userId, documentId, v2, guess) {
+  awaitingKind.set(String(userId), { documentId: String(documentId), v2, guess, awaiting: guess ? 'confirm' : 'type', expiresAt: Date.now() + KIND_WAIT_MS });
+  if (awaitingKind.size > 2000) awaitingKind.delete(awaitingKind.keys().next().value);
+  return docKind.confirmQuestion(guess);
+}
+
+const TOP_LEVEL_TYPES = new Set(['aadhaar', 'pan', 'passport', 'license']);
+
+// Saves the kind on the document. A corrected kind also renames it; a confirmed guess keeps its richer printed title.
+async function applyKind(user, pending, kind, { changed }) {
+  const set = { 'structuredData.documentType': kind.key, typeConfirmedAt: new Date(), documentType: TOP_LEVEL_TYPES.has(kind.key) ? kind.key : 'other' };
+  if (changed) set['structuredData.documentTitle'] = kind.label;
+  if (!pending.v2) {
+    await Document.updateOne({ _id: pending.documentId, userId: user._id }, { $set: set });
+    return true;
+  }
+  // An encrypted document's details are inside its encrypted record: open it with the vault key, change it, seal it again.
+  const entry = vaultEntry(String(user._id));
+  if (!entry) return false;
+  const row = await Document.findOne({ _id: pending.documentId, userId: user._id, securityVersion: 2 }).select('encryptedStructuredData');
+  if (!row?.encryptedStructuredData) return false;
+  const data = await decryptPayload(row.encryptedStructuredData, entry.key);
+  if (!data || typeof data !== 'object') return false;
+  data.documentType = kind.key;
+  if (changed) data.documentTitle = kind.label;
+  await Document.updateOne({ _id: pending.documentId, userId: user._id }, { $set: { encryptedStructuredData: JSON.stringify(await encryptPayload(data, entry.key, entry.salt)), typeConfirmedAt: new Date(), documentType: set.documentType } });
+  const held = entry.data.docs.find((d) => d.id === pending.documentId);
+  if (held) { held.type = kind.key; if (changed) held.title = kind.label; }
+  return true;
+}
+
+// Reads the member's answer to "is that correct?". Returns true when the message was an answer (and was handled).
+async function handleKindReply(msg, user, text) {
+  const id = String(user._id);
+  const pending = awaitingKind.get(id);
+  if (!pending) return false;
+  if (pending.expiresAt <= Date.now()) { awaitingKind.delete(id); return false; }
+
+  const finish = async (kind, changed, lead) => {
+    awaitingKind.delete(id);
+    const ok = await applyKind(user, pending, kind, { changed }).catch((error) => { console.error(`[whatsapp] could not save the document kind: ${error.message}`); return false; });
+    await msg.reply(ok ? `${lead} *${kind.label}*.` : `Thanks. I could not update it just now, so I kept my first guess. You can change it in the app under Documents.`);
+    return true;
+  };
+
+  if (docKind.YES.test(text)) {
+    if (pending.guess) return finish(pending.guess, false, 'Great, it is saved as your');
+    await msg.reply(`What kind of document is it? (for example ${docKind.EXAMPLES})`);
+    return true;
+  }
+  if (docKind.NO.test(text)) {
+    pending.awaiting = 'type';
+    pending.expiresAt = Date.now() + KIND_WAIT_MS;
+    await msg.reply(`Okay, what kind of document is it? (for example ${docKind.EXAMPLES})`);
+    return true;
+  }
+  const named = docKind.kindFromText(text);
+  if (named && text.length <= 60) return finish(named, !pending.guess || named.key !== pending.guess.key, 'Thanks, I saved it as your');
+  if (pending.awaiting === 'type') {
+    const label = docKind.customLabel(text);
+    if (label) return finish({ key: 'other', label }, true, 'Okay, I saved it as');
+  }
+  awaitingKind.delete(id); // they moved on to something else; the guess stays and the message is handled normally
+  return false;
 }
 
 async function typing(msg) {
@@ -330,7 +464,8 @@ function formatEligibility(r) {
   return lines.join('\n');
 }
 
-async function describeUpload(documentId, reveal = false) {
+async function describeUpload(documentId, reveal = false, userId = null) {
+  const ask = (guess) => (userId ? `\n\n${askKind(userId, documentId, false, guess)}` : '');
   const deadline = Date.now() + READ_WAIT_MS;
   let doc;
   while (Date.now() < deadline) {
@@ -338,27 +473,30 @@ async function describeUpload(documentId, reveal = false) {
     if (doc && ['completed', 'failed'].includes(doc.ocrStatus)) break;
     await new Promise((resolve) => setTimeout(resolve, 2500));
   }
-  if (!doc || doc.ocrStatus === 'failed') return 'I saved the file, but could not read any text from it. A clearer photo or a PDF usually works better.';
-  if (doc.ocrStatus !== 'completed') return 'I saved the file and I am still reading it. Ask "documents" in a minute to see it.';
+  if (!doc || doc.ocrStatus === 'failed') return `I saved the file, and you can ask me to send it back, but I could not read any text from it. A clearer photo or a PDF usually works better.${ask(null)}`;
+  if (doc.ocrStatus !== 'completed') return `I saved the file and I am still reading it. Ask "documents" in a minute to see it.${ask(null)}`;
 
   const d = doc.structuredData || {};
+  const guess = docKind.guessKind({ documentType: d.documentType !== 'other' ? d.documentType : doc.documentType, documentTitle: d.documentTitle, text: doc.extractedText });
   const rows = [
-    ['Type', TYPE_LABEL[d.documentType] || TYPE_LABEL[doc.documentType]],
+    ['Type', guess ? guess.label : (TYPE_LABEL[d.documentType] || TYPE_LABEL[doc.documentType])],
     ['Name', d.fullName], ['Date of birth', d.dateOfBirth], ['Gender', d.gender],
     ['Aadhaar', reveal && d.aadhaarNumber ? spaced(d.aadhaarNumber) : maskTail(d.aadhaarNumber)], ['PAN', reveal ? d.panNumber : maskTail(d.panNumber)],
     ['Address', d.address],
   ].filter(([, v]) => v);
-  if (!rows.length) return 'I saved the file, but could not find any details in it. A clearer photo or a PDF usually works better.';
-  return `Saved. Here is what I read:\n\n${rows.map(([k, v]) => `*${k}*: ${v}`).join('\n')}\n\nIf something is wrong, you can correct it in the app under Documents.`;
+  if (!rows.length) return `I saved the file, but could not find any details in it. A clearer photo or a PDF usually works better.${ask(guess)}`;
+  return `Saved${guess ? ` as a *${guess.label}*` : ''}. Here is what I read:\n\n${rows.map(([k, v]) => `*${k}*: ${v}`).join('\n')}\n\nIf a detail is wrong, you can correct it in the app under Documents.${ask(guess)}`;
 }
 
 async function listDocuments(user) {
-  const docs = await Document.find({ userId: user._id }).sort({ uploadedAt: -1 }).limit(15).select('originalName documentType ocrStatus securityVersion uploadedAt').lean();
+  const docs = await Document.find({ userId: user._id }).sort({ uploadedAt: -1 }).limit(15).select('originalName documentType ocrStatus securityVersion uploadedAt structuredData.documentTitle structuredData.documentType').lean();
   if (!docs.length) return 'You have no documents stored yet. Send me a photo or PDF of one and I will save it.';
   const lines = docs.map((d, i) => {
-    const name = d.securityVersion === 2 ? 'Encrypted document' : d.originalName;
+    const named = d.securityVersion === 2 ? 'Encrypted document' : /^whatsapp-\d+\.\w+$/i.test(d.originalName || '') ? '' : d.originalName;
     const state = d.ocrStatus === 'completed' ? 'read' : d.ocrStatus === 'failed' ? 'could not be read' : 'being read';
-    return `${i + 1}. ${name} (${TYPE_LABEL[d.documentType] || 'Document'}, ${state})`;
+    const kind = d.securityVersion === 2 ? (TYPE_LABEL[d.documentType] || 'Document') : (d.structuredData?.documentTitle || TYPE_LABEL[d.structuredData?.documentType] || TYPE_LABEL[d.documentType] || 'Document');
+    // What it is comes first. The file name only helps when it says something (a photo from WhatsApp is just a number).
+    return `${i + 1}. ${kind}${named && named !== kind ? ` - ${named}` : ''} (${state})`;
   });
   return `*Your documents*\n${lines.join('\n')}`;
 }
@@ -387,7 +525,14 @@ const agentDeps = {
 
 async function sendFile(msg, file) {
   const { MessageMedia } = require('whatsapp-web.js');
-  await msg.reply(new MessageMedia(file.mimeType, file.buffer.toString('base64'), file.filename), undefined, { caption: file.filename });
+  const media = new MessageMedia(file.mimeType, file.buffer.toString('base64'), file.filename);
+  try {
+    await msg.reply(media, undefined, { caption: file.filename });
+  } catch (error) {
+    // WhatsApp Web sometimes refuses a file sent as an inline photo or video; as a document attachment it goes through.
+    console.warn(`[whatsapp] sending ${file.mimeType} inline failed (${String(error?.message ?? error).slice(0, 120)}), sending it as a document`);
+    await msg.reply(media, undefined, { caption: file.filename, sendMediaAsDocument: true });
+  }
 }
 
 // Hands the message to the agent. Returns the text to send, or '' when the answer was already handled here
@@ -497,9 +642,14 @@ async function handleIncoming(msg, wa) {
       }
       const file = await readMedia(msg, wa);
       if (!file) return;
-      const document = await savePlainDocument({ userId: user._id, buffer: file.buffer, originalName: file.originalName, mimeType: file.mimeType, documentType: 'other' });
+      const document = await savePlainDocument({ userId: user._id, buffer: file.buffer, originalName: file.originalName, mimeType: file.mimeType, documentType: 'other', skipOcr: !file.ocr });
+      if (!file.ocr) {
+        await msg.reply(`Saved *${file.originalName}*. Ask me to send it back any time.\n\n${askKind(user._id, document._id, false, null)}`);
+        stats.answered += 1; stats.lastAnsweredAt = Date.now();
+        return;
+      }
       await msg.reply('Got it. Reading your document now, this takes a few seconds.');
-      await msg.reply(clip(await describeUpload(document._id, revealActive(user._id))));
+      await msg.reply(clip(await describeUpload(document._id, revealActive(user._id), user._id)));
       stats.answered += 1; stats.lastAnsweredAt = Date.now();
       return;
     }
@@ -519,6 +669,12 @@ async function handleIncoming(msg, wa) {
     if (/^lock$/i.test(text)) {
       agentDeps.lock(id);
       await msg.reply('Locked. I am showing masked numbers again.');
+      return;
+    }
+
+    // The answer to "is that the right kind of document?" after an upload.
+    if (awaitingKind.has(id) && await handleKindReply(msg, user, text)) {
+      stats.answered += 1; stats.lastAnsweredAt = Date.now();
       return;
     }
 
@@ -609,6 +765,8 @@ async function handleIncoming(msg, wa) {
 }
 
 exports.handleIncoming = handleIncoming;
+exports.askKind = askKind;
+exports.handleKindReply = handleKindReply;
 exports.attach = (wa) => wa.onMessage(handleIncoming);
 exports.HELP = HELP;
 // Closes a member's opened vault now, for example when they switch the setting off.

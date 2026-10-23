@@ -42,6 +42,16 @@ const documentSchema = new mongoose.Schema({
   structuredData: {
     type: mongoose.Schema.Types.Mixed
   },
+  // When the document's own labelled fields (vehicle class, roll no, marks...) were last read. Older documents get it on demand.
+  fieldsExtractedAt: {
+    type: Date,
+    default: null
+  },
+  // When the member confirmed (or corrected) what kind of document this is, in the WhatsApp chat.
+  typeConfirmedAt: {
+    type: Date,
+    default: null
+  },
   // S3 specific fields
   storageType: {
     type: String,
