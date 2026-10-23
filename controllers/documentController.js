@@ -632,24 +632,8 @@ exports.deleteDocument = async (req, res) => {
       });
     }
 
-    // The stored file goes first (R2, S3, GridFS or disk). If the storage cannot be reached it is queued and retried, never forgotten.
-    await StorageService.removeStored(document);
-
-    // Remove from DB
-    await document.deleteOne();
-
-    // Rebuild user extractedData from remaining documents so profile stays accurate
-    const remainingDocs = await Document.find({
-      userId: req.userId,
-      ocrStatus: 'completed',
-    }).select('structuredData');
-
-    const merged = {};
-    for (const doc of remainingDocs) {
-      if (doc.structuredData) Object.assign(merged, docFields.cleanKnown(doc.structuredData));
-    }
-
-    await User.findByIdAndUpdate(req.userId, { extractedData: merged });
+    // The file, the record and the details read from it (kept elsewhere only if another document still holds the same value).
+    await require('../services/myData').deleteDocumentWithData(req.userId, document);
 
     return res.json({
       success: true,

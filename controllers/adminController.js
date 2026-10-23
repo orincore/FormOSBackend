@@ -695,8 +695,7 @@ exports.deleteUserDocument = async (req, res) => {
     const document = await Document.findOne({ _id: req.params.docId, userId: target._id });
     if (!document) return fail(res, 404, 'DOCUMENT_NOT_FOUND', 'Document not found.');
 
-    await StorageService.removeStored(document);
-    await document.deleteOne();
+    await require('../services/myData').deleteDocumentWithData(target._id, document);
 
     await audit(req, 'document.deleted', target, { name: document.originalName, type: document.documentType });
     return res.json({ success: true, message: 'Document deleted.' });

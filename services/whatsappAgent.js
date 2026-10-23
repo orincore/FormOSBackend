@@ -970,10 +970,11 @@ async function executeDelete(ctx, pending) {
   }
   const row = await Document.findOne({ _id: pending.docId, userId: ctx.user._id });
   if (!row) return { text: 'That document is already gone.' };
-  await StorageService.removeStored(row);
-  await Document.deleteOne({ _id: row._id });
+  const gone = await myData.deleteDocumentWithData(ctx.user._id, row);
+  clearFocus(ctx.user._id);
   if (ctx.entry) ctx.entry.data.docs = ctx.entry.data.docs.filter((d) => d.id !== String(row._id));
-  return { text: `Deleted *${pending.name}*.` };
+  const names = (gone.cleared || []).map((k) => FIELD_LABEL[k]?.toLowerCase()).filter(Boolean);
+  return { text: `Deleted *${pending.name}* and the details read from it${names.length ? ` (${names.join(', ')})` : ''}.` };
 }
 
 module.exports = { takePendingJob, peekPendingJob, dataDeletion, parseLabelValue, clearFocus, parseCorrection, replaceFragment, answerGrounded, recordsFor, run, executeDelete, parseSaveStatements, cleanFields, impliedCall, TOOLS, toolDefs, PinRequired, resolveDoc };
