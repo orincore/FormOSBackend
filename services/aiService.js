@@ -179,7 +179,7 @@ class AIService {
     this.enforcePolicyGuard(system, '', options);
     if (!this.openrouter) throw new Error('No vision provider is configured');
     const model = options.model || process.env.AI_VISION_MODEL || 'openai/gpt-4o';
-    const body = { model, messages, temperature: 0, max_tokens: 12000, response_format: { type: 'json_object' } };
+    const body = { model, messages, temperature: 0, max_tokens: options.maxTokens || 12000, ...(options.json === false ? {} : { response_format: { type: 'json_object' } }) };
     if (options.plugins) body.plugins = options.plugins;
     const response = await this.openrouter.chat.completions.create(body, { timeout: options.timeout || 120000, maxRetries: 1 });
     const message = response.choices?.[0]?.message;

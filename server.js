@@ -62,6 +62,7 @@ app.use('/api/documents', require('./routes/documents'));
 app.use('/api/chat', require('./routes/chat'));
 app.use('/api/whatsapp', require('./routes/whatsapp'));
 app.use('/api/autofill', require('./routes/autofill'));
+app.use('/api/mydata', require('./routes/myData'));
 app.use('/api/form-analyzer', require('./routes/formAnalyzer'));
 app.use('/api/eligibility', require('./routes/eligibility'));
 app.use('/api/extension', require('./routes/extension'));

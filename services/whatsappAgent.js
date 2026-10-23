@@ -20,12 +20,8 @@ class PinRequired extends Error {
   constructor() { super('PIN required'); this.name = 'PinRequired'; }
 }
 
-const FIELD_LABEL = {
-  fullName: 'Name', fatherName: "Father's name", dateOfBirth: 'Date of birth', gender: 'Gender',
-  aadhaarNumber: 'Aadhaar', panNumber: 'PAN', passportNumber: 'Passport', drivingLicenseNumber: 'Licence',
-  address: 'Address', pincode: 'PIN code', state: 'State', phone: 'Phone', email: 'Email',
-};
-const SENSITIVE = new Set(['aadhaarNumber', 'panNumber', 'passportNumber', 'drivingLicenseNumber']);
+const { FIELD_LABEL, SENSITIVE, cleanField, cleanFields } = require('./fieldRules');
+const myData = require('./myData');
 const TYPE_LABEL = { aadhaar: 'Aadhaar card', pan: 'PAN card', passport: 'Passport', license: 'Driving licence', voter: 'Voter ID card', vehicle: 'Vehicle registration (RC)', marksheet: 'Marksheet', certificate: 'Certificate', bank: 'Bank document', insurance: 'Insurance document', other: 'Document' };
 
 const spaced = (n) => String(n).replace(/(\d{4})(?=\d)/g, '$1 ');
@@ -33,72 +29,6 @@ const show = (key, value, reveal) => {
   if (!SENSITIVE.has(key) || reveal) return key === 'aadhaarNumber' ? spaced(value) : value;
   return `****${String(value).slice(-4)}`;
 };
-
-// ---- validation for data saved from the chat ---------------------------------------------------------------
-const STATES = /^[A-Za-z .&-]{2,40}$/;
-function cleanField(key, raw) {
-  const v = String(raw ?? '').trim();
-  if (!v) return { error: 'it was empty' };
-  switch (key) {
-    case 'fullName': case 'fatherName':
-      return /^[A-Za-z][A-Za-z .'-]{1,79}$/.test(v) ? { value: v.replace(/\s+/g, ' ') } : { error: 'a name should be letters only' };
-    case 'dateOfBirth': {
-      const iso = v.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-      const dmy = v.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})$/);
-      const [d, m, y] = iso ? [iso[3], iso[2], iso[1]] : dmy ? [dmy[1], dmy[2], dmy[3]] : [];
-      if (!y || Number(m) < 1 || Number(m) > 12 || Number(d) < 1 || Number(d) > 31 || Number(y) < 1900 || Number(y) > new Date().getFullYear()) return { error: 'use a date like 14/03/1996' };
-      return { value: `${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}/${y}` };
-    }
-    case 'gender': {
-      const g = v.toLowerCase();
-      if (/^(m|male|man)$/.test(g)) return { value: 'Male' };
-      if (/^(f|female|woman)$/.test(g)) return { value: 'Female' };
-      if (/^(other|transgender|non.?binary)$/.test(g)) return { value: 'Other' };
-      return { error: 'use Male, Female or Other' };
-    }
-    case 'aadhaarNumber': {
-      const d = v.replace(/\D/g, '');
-      return ocrService.isValidAadhaar(d) ? { value: d } : { error: 'that is not a valid Aadhaar number' };
-    }
-    case 'panNumber': {
-      const p = v.toUpperCase().replace(/\s/g, '');
-      return /^[A-Z]{5}\d{4}[A-Z]$/.test(p) ? { value: p } : { error: 'a PAN looks like ABCDE1234F' };
-    }
-    case 'passportNumber': {
-      const p = v.toUpperCase().replace(/\s/g, '');
-      return /^[A-Z]\d{7}$/.test(p) ? { value: p } : { error: 'a passport number looks like K1234567' };
-    }
-    case 'drivingLicenseNumber': {
-      const p = v.toUpperCase().replace(/[\s-]/g, '');
-      return /^[A-Z]{2}\d{13}$/.test(p) ? { value: p } : { error: 'a licence number looks like MH0120190000001' };
-    }
-    case 'address': return v.length >= 6 && v.length <= 300 ? { value: v.replace(/\s+/g, ' ') } : { error: 'the address should be 6 to 300 characters' };
-    case 'pincode': return /^[1-9]\d{5}$/.test(v) ? { value: v } : { error: 'a PIN code has 6 digits' };
-    case 'state': return STATES.test(v) ? { value: v } : { error: 'that does not look like a state' };
-    case 'phone': {
-      const d = v.replace(/\D/g, '').replace(/^(91|0)(?=\d{10}$)/, '');
-      return /^[6-9]\d{9}$/.test(d) ? { value: d } : { error: 'a mobile number has 10 digits' };
-    }
-    case 'email': return /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(v) && v.length <= 120 ? { value: v.toLowerCase() } : { error: 'that is not a valid email' };
-    default: return { error: 'I do not save that field' };
-  }
-}
-
-function cleanFields(fields = {}, custom = {}) {
-  const ok = {}; const bad = [];
-  for (const [key, raw] of Object.entries(fields || {})) {
-    if (!FIELD_LABEL[key]) { bad.push(`${key}: I do not save that field`); continue; }
-    const r = cleanField(key, raw);
-    if (r.error) bad.push(`${FIELD_LABEL[key]}: ${r.error}`); else ok[key] = r.value;
-  }
-  const extra = {};
-  for (const [label, raw] of Object.entries(custom || {}).slice(0, 10)) {
-    const k = String(label).trim().replace(/[^A-Za-z0-9 _-]/g, '').slice(0, 40);
-    const v = String(raw ?? '').trim().slice(0, 200);
-    if (k && v) extra[k] = v; else bad.push(`${label || 'note'}: it was empty`);
-  }
-  return { ok, extra, bad };
-}
 
 // ---- documents: one list, one way to point at an item ------------------------------------------------------
 async function docList(ctx) {
@@ -277,10 +207,17 @@ Rules:
 - If several documents could answer and they disagree, use the newest and say which document it is from.
 - Questions about how to do something (apply for a card, fill a form) are NOT answered from the records: reply NOTFOUND:.`;
   try {
-    const reply = await aiService.chat(system, `RECORDS:\n\n${blocks.join('\n\n')}\n\nQUESTION: ${String(question).slice(0, 400)}\n\nANSWER:`, {
+    // Answers are read from the member's saved data, so they use the stronger model (a small one miscounts and mixes up rows).
+    const reply = await aiService.chatVision([
+      { role: 'system', content: system },
+      { role: 'user', content: `RECORDS:\n\n${blocks.join('\n\n')}\n\nQUESTION: ${String(question).slice(0, 400)}\n\nANSWER:` },
+    ], {
       user: { securityVersion: 1, _id: ctx.user._id },
       operation: aiService.AI_OPERATION.RAG,
-      primaryTimeout: 30000,
+      model: process.env.AI_ANSWER_MODEL || 'openai/gpt-4o',
+      json: false,
+      maxTokens: 700,
+      timeout: 45000,
     });
     const text = String(reply || '').trim();
     const found = /^FOUND:/i.test(text);
@@ -317,11 +254,118 @@ async function answerRequested(ctx, keys, docType = null) {
     const value = docType ? fromDoc?.fields?.[key] : (profile[key] || fromDoc?.fields?.[key]);
     if (value) lines.push(`*${FIELD_LABEL[key]}*: ${show(key, value, reveal)}`); else missing.push(FIELD_LABEL[key].toLowerCase());
   }
+  rememberFocus(ctx, keys.filter((k) => !missing.includes(FIELD_LABEL[k].toLowerCase())), docType);
   const out = [...lines];
   if (missing.length) out.push(`I do not have your ${missing.join(' or ')}${docType ? ` on your ${TYPE_LABEL[docType] || 'document'}` : ' saved'}. Send a photo of a document that shows it, or tell me and I will save it.`);
   const masked = !reveal && keys.some((k) => SENSITIVE.has(k) && (profile[k] || pool.some((d) => d.fields?.[k])));
   if (masked) out.push('The number is masked. Say *full* to see it (I will ask for your PIN).');
   return out.join('\n');
+}
+
+// ---- what the conversation is about ---------------------------------------------------------------------------------
+// The assistant remembers WHICH details it just showed (field names and the kind of document, never the values), so "it", "that"
+// and "it is 47 not 41" mean something. The values themselves are always read fresh from the saved data.
+const focusByUser = new Map();
+const FOCUS_MS = 15 * 60 * 1000;
+function rememberFocus(ctx, keys, docType = null) {
+  const list = [...new Set((keys || []).filter((k) => FIELD_LABEL[k]))];
+  if (!list.length) return;
+  focusByUser.set(String(ctx.user._id), { keys: list, docType, at: Date.now() });
+  if (focusByUser.size > 2000) focusByUser.delete(focusByUser.keys().next().value);
+}
+const focusOf = (ctx) => {
+  const f = focusByUser.get(String(ctx.user._id));
+  return f && Date.now() - f.at < FOCUS_MS ? f : null;
+};
+const clearFocus = (userId) => focusByUser.delete(String(userId));
+const focusNote = (ctx) => {
+  const f = focusOf(ctx);
+  if (!f) return '';
+  return `\nConversation focus: the member was just shown their ${f.keys.map((k) => FIELD_LABEL[k].toLowerCase()).join(' and ')}${f.docType ? ` from their ${TYPE_LABEL[f.docType] || 'document'}` : ''}. Words like "it", "that" or "this" refer to that.`;
+};
+
+// ---- corrections: "it is 47 not 41", "change it to ..." ----------------------------------------------------------------
+// Understood in code, against what was just shown, so a short correction is applied exactly. The model is not involved.
+function parseCorrection(text) {
+  const t = String(text || '').trim();
+  if (t.length > 140) return null;
+  const lead = "(?:no[,.]?\\s+|actually[,.]?\\s+)?";
+  let m = t.match(new RegExp(`^${lead}(?:it'?s|it is|its|should be|is|make it)\\s+(\\S.*?)\\s*,?\\s+(?:and\\s+)?(?:not|instead of|rather than)\\s+(\\S.*?)(?:\\s*,?\\s*(?:please\\s+)?(?:correct|fix|change|update)(?:\\s+(?:it|that))?)?\\s*[.!]*$`, 'i'));
+  if (m) return { nu: m[1].trim(), old: m[2].trim() };
+  m = t.match(/\b(?:the\s+)?(?:last|ending)\s+(?:\d+\s+)?(?:digits?|numbers?|characters?)\s+(?:is|are|should be|=)\s+(\S+)/i);
+  if (m) return { nu: m[1].trim(), tail: true };
+  m = t.match(new RegExp(`^${lead}(?:(?:please\\s+)?(?:correct|fix|change|update)\\s+(?:it|that|this)\\s+(?:to|as|with)|it'?s|it is|its|should be|make it)\\s+(\\S.*?)\\s*[.!]*$`, 'i'));
+  if (m && m[1].length >= 5) return { nu: m[1].trim() };
+  return null;
+}
+
+// Puts `fresh` where `stale` is in `current`, at its last occurrence, keeping the number's spacing ("MH05 2022000041" stays grouped).
+function replaceFragment(current, stale, fresh) {
+  const squash = (x) => String(x).replace(/[\s-]/g, '');
+  const cur = squash(current); const o = squash(stale); const n = squash(fresh);
+  const at = o ? cur.toUpperCase().lastIndexOf(o.toUpperCase()) : -1;
+  if (at < 0) return null;
+  const next = cur.slice(0, at) + n + cur.slice(at + o.length);
+  const gaps = []; let seen = 0;
+  for (const ch of String(current)) { if (/[\s-]/.test(ch)) gaps.push([seen, ch]); else seen += 1; }
+  let out = ''; let g = 0;
+  for (let i = 0; i < next.length; i++) {
+    while (g < gaps.length && gaps[g][0] === i) { out += gaps[g][1]; g += 1; }
+    out += next[i];
+  }
+  return out;
+}
+
+// What is saved for a detail right now: the profile first, then the documents. Read fresh, on the server only.
+async function currentValue(ctx, key) {
+  const u = await User.findById(ctx.user._id).lean();
+  if (u?.extractedData?.[key]) return String(u.extractedData[key]);
+  const doc = await Document.findOne({ userId: ctx.user._id, securityVersion: { $ne: 2 }, [`structuredData.${key}`]: { $exists: true, $ne: '' } }).sort({ uploadedAt: -1 }).select(`structuredData.${key}`).lean();
+  return doc?.structuredData?.[key] ? String(doc.structuredData[key]) : '';
+}
+
+// Saves a changed detail everywhere it lives (profile and documents), the same way the My data page does.
+const syncDetail = (ctx, key, fresh) => myData.syncDetail(ctx.user._id, key, fresh);
+
+async function tryCorrection(ctx) {
+  const focus = focusOf(ctx);
+  if (!focus || ctx.user.securityVersion === 2) return null;
+  const fix = parseCorrection(ctx.text);
+  if (!fix) return null;
+
+  // Which detail: one the message names ("licence"), else the one just shown.
+  const named = (requestedFields(ctx.text).keys || []).filter((k) => FIELD_LABEL[k]);
+  const keys = named.length ? named : focus.keys;
+  if (keys.length !== 1) return { text: `Which one do you want to change: ${keys.map((k) => FIELD_LABEL[k].toLowerCase()).join(' or ')}? Tell me, for example "change my ${FIELD_LABEL[keys[0]].toLowerCase()} to ...".` };
+  const key = keys[0];
+  if (SENSITIVE.has(key)) needsUnlock(ctx); // changing an ID number needs the PIN, like seeing it in full
+
+  const current = await currentValue(ctx, key);
+  if (!current) return { text: `I do not have your ${FIELD_LABEL[key].toLowerCase()} saved yet, so there is nothing to correct. Tell me the full number and I will save it.` };
+
+  let candidate;
+  if (fix.old) {
+    candidate = replaceFragment(current, fix.old, fix.nu);
+    if (!candidate) return { text: `I could not find "${fix.old}" in your saved ${FIELD_LABEL[key].toLowerCase()}, so I changed nothing. Tell me the full correct number.` };
+  } else if (fix.tail) {
+    const squash = current.replace(/[\s-]/g, '');
+    const n = fix.nu.replace(/[\s-]/g, '').length;
+    candidate = replaceFragment(current, squash.slice(-n), fix.nu);
+  } else if (fix.nu.replace(/[\s-]/g, '').length < 5 && /^\d+$/.test(fix.nu.replace(/[\s-]/g, ''))) {
+    return { text: `Do you mean the last digits of your ${FIELD_LABEL[key].toLowerCase()} should be ${fix.nu}? Say "the last digits are ${fix.nu}", or tell me the full number.` };
+  } else {
+    candidate = fix.nu;
+  }
+
+  const checked = cleanField(key, candidate);
+  // A bare "it is ..." that is not a valid value for this detail was most likely not a correction at all: leave it to the assistant.
+  if (checked.error && !fix.old && !fix.tail) return null;
+  if (checked.error) return { text: `I did not change anything: ${FIELD_LABEL[key]}, ${checked.error}.` };
+  if (checked.value.replace(/\s/g, '') === current.replace(/\s/g, '')) return { text: `Your ${FIELD_LABEL[key].toLowerCase()} is already ${show(key, current, ctx.unlocked)}.` };
+
+  const docs = await syncDetail(ctx, key, checked.value);
+  rememberFocus(ctx, [key], focus.docType);
+  return { text: `Done. I changed your ${FIELD_LABEL[key].toLowerCase()} to *${show(key, checked.value, ctx.unlocked)}*${docs ? ` on your profile and ${docs} document${docs === 1 ? '' : 's'}` : ' on your profile'}.` };
 }
 
 // ---- the tools -----------------------------------------------------------------------------------------------
@@ -440,6 +484,8 @@ const TOOLS = {
     async run(ctx, { fields, custom }) {
       const blocked = needsVault(ctx); if (blocked) return blocked;
       const { ok, extra, bad } = cleanFields(fields, custom);
+      // Saving or changing an ID number needs the PIN, like seeing it in full.
+      if (ctx.user.securityVersion !== 2 && Object.keys(ok).some((k) => SENSITIVE.has(k))) needsUnlock(ctx);
       const saved = Object.keys(ok).map((k) => FIELD_LABEL[k]).concat(Object.keys(extra));
       if (saved.length) {
         if (ctx.user.securityVersion === 2) {
@@ -455,6 +501,9 @@ const TOOLS = {
           Object.entries(extra).forEach(([k, v]) => { set[`extractedData.customFields.${k.replace(/\./g, ' ')}`] = v; });
           if (ok.phone) set.phone = ok.phone;
           await User.updateOne({ _id: ctx.user._id }, { $set: set });
+          // A document that holds this detail is changed with it, so answers read from the document agree with the profile.
+          for (const [k, v] of Object.entries(ok)) if (SENSITIVE.has(k)) await syncDetail(ctx, k, v);
+          rememberFocus(ctx, Object.keys(ok));
         }
       }
       const parts = [];
@@ -489,6 +538,7 @@ const TOOLS = {
       const usual = limitTo(ctx.text);
       if (usual && !documentDetailsFor(ctx.text)) {
         const rows = usual.filter((k) => r.doc.fields[k]).map((k) => `${FIELD_LABEL[k]}: ${show(k, r.doc.fields[k], reveal)}`);
+        rememberFocus(ctx, usual.filter((k) => r.doc.fields[k]), r.doc.type);
         return { text: rows.length ? `*${title}*\n${rows.join('\n')}` : `I could not find that on *${title}*.` };
       }
       if (!documentDetailsFor(ctx.text) && !wantsEverything(ctx.text)) {
@@ -553,6 +603,47 @@ const TOOLS = {
       const r = await resolveDoc(ctx, document); if (r.error) return { text: r.error };
       ctx.deps.setPending(ctx.user._id, { type: 'delete', docId: r.doc.id, name: r.doc.name });
       return { text: `Delete *${r.doc.name}* permanently? This cannot be undone. Reply *yes* to delete it or *no* to keep it.` };
+    },
+  },
+
+  delete_my_data: {
+    description: "Delete saved personal data on the member's request: one detail (their phone number, PAN number, address ...), everything read from one document (keeping the file), or all of their saved details and documents. This only asks the member to confirm: nothing is deleted until they reply. Requires their PIN. NOT for deleting a document file (use delete_document).",
+    parameters: {
+      type: 'object',
+      properties: {
+        what: { type: 'string', enum: ['detail', 'document_data', 'details', 'everything'], description: "detail = one saved detail; document_data = what was read from one document; details = all saved details (documents stay); everything = all details and all documents" },
+        field: { type: 'string', enum: Object.keys(FIELD_LABEL), description: 'For what=detail: which one' },
+        document: { type: 'string', description: 'For what=document_data: the document name, type or list number' },
+      },
+      required: ['what'],
+    },
+    async run(ctx, { what, field, document }) {
+      if (ctx.user.securityVersion === 2) return { text: 'Your account still uses the retired encrypted mode. Open FormOS > Settings > Move to standard storage first, then I can manage your data here. You can also manage it in the app under My data.' };
+      needsUnlock(ctx);
+      if (what === 'detail') {
+        const key = FIELD_LABEL[field] ? field : (requestedFields(ctx.text).keys || [])[0];
+        if (!key || key === 'email') return { text: key === 'email' ? 'Your sign-in email cannot be deleted here. You can change it in the app under Settings.' : 'Which detail should I delete? For example "delete my phone number".' };
+        const u = await User.findById(ctx.user._id).lean();
+        const inDocs = await myData.countHolding(ctx.user._id, key);
+        if (!(u?.extractedData?.[key]) && !inDocs) return { text: `I do not have your ${FIELD_LABEL[key].toLowerCase()} saved, so there is nothing to delete.` };
+        ctx.deps.setPending(ctx.user._id, { type: 'delete_field', key });
+        return { text: `Delete your *${FIELD_LABEL[key].toLowerCase()}*? I will remove it from your profile${inDocs ? ` and from ${inDocs} document${inDocs === 1 ? '' : 's'} (the document files stay)` : ''}. This cannot be undone. Reply *yes* to delete it or *no* to keep it.` };
+      }
+      if (what === 'document_data') {
+        const r = await resolveDoc(ctx, document); if (r.error) return { text: r.error };
+        ctx.deps.setPending(ctx.user._id, { type: 'clear_doc_data', docId: r.doc.id, name: r.doc.title || r.doc.name });
+        return { text: `Delete everything FormOS read from *${r.doc.title || r.doc.name}*? The file itself stays. This cannot be undone. Reply *yes* to delete it or *no* to keep it.` };
+      }
+      if (what === 'details') {
+        ctx.deps.setPending(ctx.user._id, { type: 'forget_details' });
+        return { text: 'Delete *all* the personal details FormOS has saved for you (your profile and everything read from your documents)? Your document files stay. This cannot be undone. Reply *yes* to delete them or *no* to keep them.' };
+      }
+      if (what === 'everything') {
+        const count = await Document.countDocuments({ userId: ctx.user._id, securityVersion: { $ne: 2 } });
+        ctx.deps.setPending(ctx.user._id, { type: 'forget_everything', phrase: 'delete everything' });
+        return { text: `This will permanently delete *all* your saved details and *all ${count} of your documents* (the files too). It cannot be undone. Your sign-in account stays.\n\nTo go ahead, reply exactly *delete everything*. Anything else cancels.` };
+      }
+      return { text: 'Tell me what to delete: a detail (for example your phone number), what was read from a document, or everything.' };
     },
   },
 
@@ -671,12 +762,28 @@ function parseSaveStatements(text) {
   grab('aadhaarNumber', /\b(?:aadhaa?r|aadhar|adhar)\b[^\d]{0,25}((?:\d{4}\s?){3})/i);
   grab('panNumber', /\bpan\b[^A-Za-z0-9]{0,25}([A-Za-z]{5}\d{4}[A-Za-z])\b/i);
   grab('passportNumber', /\bpassport\b[^A-Za-z0-9]{0,25}([A-Za-z]\d{7})\b/i);
+  grab('drivingLicenseNumber', /\b(?:driving\s+)?(?:licen[cs]e|dl)\b(?:\s*(?:no\.?|number))?[\s:=-]{0,6}([A-Za-z]{2}[\s-]?\d{2}[\s-]?\d{4,}(?:[\s-]?\d+)*)/i);
   grab('email', /\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/);
   grab('phone', /\b(?:phone|mobile|number|contact)\b[^\d]{0,25}((?:\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5})\b/i);
   grab('dateOfBirth', /\b(?:dob|birth|born)\b[^\d]{0,25}(\d{1,2}[\/.-]\d{1,2}[\/.-]\d{4})/i);
   grab('pincode', /\b(?:pin ?code|pincode|postal code)\b[^\d]{0,15}([1-9]\d{5})\b/i);
   grab('fullName', /\bmy name is\s+([A-Za-z][A-Za-z .'-]{1,60}?)(?:\s+and\b|[,.]|$)/i);
   return Object.keys(f).length ? f : null;
+}
+
+// A message that is just "Licence: MH05 2022000047" or "PAN = ABCDE1234F" is a request to save that detail. Understood in code, so it
+// does not depend on which tool the model picks.
+const LABELS = [
+  ['drivingLicenseNumber', /^(?:driving\s+)?(?:licen[cs]e|dl)(?:\s*(?:no\.?|number))?$/i], ['aadhaarNumber', /^(?:aadhaa?r|aadhar|adhar)(?:\s*(?:no\.?|number|card))?$/i],
+  ['panNumber', /^pan(?:\s*(?:no\.?|number|card))?$/i], ['passportNumber', /^passport(?:\s*(?:no\.?|number))?$/i],
+  ['phone', /^(?:phone|mobile|contact)(?:\s*(?:no\.?|number))?$/i], ['email', /^e-?mail(?:\s*(?:id|address))?$/i],
+  ['dateOfBirth', /^(?:dob|date of birth|birth\s*date)$/i], ['pincode', /^(?:pin\s*code|pincode|postal code)$/i],
+];
+function parseLabelValue(text) {
+  const m = String(text || '').trim().match(/^([A-Za-z][A-Za-z .'-]{1,28}?)\s*[:=]\s*(\S[^\n?]{2,100})$/);
+  if (!m) return null;
+  const hit = LABELS.find(([, re]) => re.test(m[1].trim()));
+  return hit ? { key: hit[0], value: m[2].trim() } : null;
 }
 
 // ---- a safety net for the two most important requests ----------------------------------------------------------
@@ -699,7 +806,22 @@ const wantsDocumentList = (text) => {
     && !/\b(number|details?|info|marks?|address|birth|dob|name on|valid|expir|send|download|delete|remove|rename|get me|give me|share)\b/i.test(t);
 };
 
+// "delete my phone number", "remove my PAN details", "delete all my data": a request to remove saved data (not a document file).
+function dataDeletion(text) {
+  const t = String(text || '');
+  if (!/\b(delete|remove|erase|forget|wipe|clear)\b/i.test(t)) return null;
+  if (/\b(all|everything|whole|entire)\b[^.?!]{0,30}\b(my\s+)?(data|details|information|info|documents?|files?)\b/i.test(t) || /\b(delete|erase|wipe)\s+everything\b/i.test(t) || /\bforget\s+(me|everything)\b/i.test(t)) {
+    return { name: 'delete_my_data', args: { what: /\b(documents?|files?|everything|forget me)\b/i.test(t) ? 'everything' : 'details' } };
+  }
+  const keys = (requestedFields(t).keys || []).filter((k) => FIELD_LABEL[k]);
+  const fileWords = /\b(card|document|doc|file|photo|pdf|image|picture|scan|copy)\b|\.(jpe?g|png|pdf)\b/i.test(t);
+  if (keys.length === 1 && !fileWords) return { name: 'delete_my_data', args: { what: 'detail', field: keys[0] } };
+  return null;
+}
+
 function impliedCall(text) {
+  const wipe = dataDeletion(text);
+  if (wipe) return wipe;
   const noun = /\b(card|copy|file|photo|pdf|document|doc|scan|image|picture|passport|licen[cs]e|mark\s*sheet|certificate)\b/i.test(text) || /\.(jpe?g|png|pdf)\b/i.test(text);
   if (!noun) return null;
   const ref = documentRef(text);
@@ -722,6 +844,22 @@ async function runTool(name, args, ctx) {
 async function run(ctx) {
   const result = { texts: [], files: [], needsPin: false, used: [] };
   const apply = (out, name) => { if (!out) return; if (out.text) result.texts.push(out.text); if (out.files) result.files.push(...out.files); if (name) result.used.push(name); };
+
+  // A short correction of the detail just shown ("it is 47 not 41") is applied exactly, against what was shown.
+  try {
+    const corrected = await tryCorrection(ctx);
+    if (corrected) { apply(corrected, 'correct_details'); return result; }
+  } catch (error) {
+    if (error instanceof PinRequired) { result.needsPin = true; return result; }
+    throw error;
+  }
+
+  // "Licence: MH05 2022000047" is a request to save that detail.
+  const labelled = parseLabelValue(ctx.text);
+  if (labelled) {
+    try { apply(await TOOLS.update_profile.run(ctx, { fields: { [labelled.key]: labelled.value } }), 'update_profile'); return result; }
+    catch (error) { if (error instanceof PinRequired) { result.needsPin = true; return result; } throw error; }
+  }
 
   // "show my documents" is answered by the list itself, so the model never invents one (with file names and made-up statuses).
   if (wantsDocumentList(ctx.text)) {
@@ -748,7 +886,7 @@ async function run(ctx) {
 
   let plan;
   try {
-    const messages = [{ role: 'system', content: SYSTEM(ctx.user) }, ...ctx.history.map((h) => ({ role: h.role, content: h.content })), { role: 'user', content: ctx.text }];
+    const messages = [{ role: 'system', content: SYSTEM(ctx.user) + focusNote(ctx) }, ...ctx.history.map((h) => ({ role: h.role, content: h.content })), { role: 'user', content: ctx.text }];
     plan = await aiService.chatWithTools(messages, toolDefs, { user: { securityVersion: ctx.user.securityVersion === 2 ? 2 : 1 }, operation: aiService.AI_OPERATION.CLASSIFICATION });
   } catch (error) {
     // The AI cannot be used for this message (policy for encrypted accounts, or it is down): save what is clearly
@@ -800,6 +938,23 @@ async function run(ctx) {
 
 // Run once the member says yes to a destructive step the agent asked about.
 async function executeDelete(ctx, pending) {
+  if (pending.type === 'delete_field') {
+    const r = await myData.deleteProfileField(ctx.user._id, pending.key, { everywhere: true });
+    return { text: r.error ? r.error : `Deleted your ${FIELD_LABEL[pending.key].toLowerCase()}${r.documents ? ` from your profile and ${r.documents} document${r.documents === 1 ? '' : 's'}` : ' from your profile'}.` };
+  }
+  if (pending.type === 'clear_doc_data') {
+    const r = await myData.clearDocumentData(ctx.user._id, pending.docId);
+    return { text: r.error ? r.error : `Deleted everything read from *${pending.name}*. The file is still stored.` };
+  }
+  if (pending.type === 'forget_details') {
+    const r = await myData.forget(ctx.user._id, { documents: false });
+    return { text: `Deleted all your saved details and everything read from your ${r.documents} document${r.documents === 1 ? '' : 's'}. The files are still stored.` };
+  }
+  if (pending.type === 'forget_everything') {
+    const r = await myData.forget(ctx.user._id, { documents: true });
+    clearFocus(ctx.user._id);
+    return { text: `Done. I deleted all your saved details and ${r.deleted} document${r.deleted === 1 ? '' : 's'}. Your account is still here: send me a document any time to start again.` };
+  }
   const row = await Document.findOne({ _id: pending.docId, userId: ctx.user._id });
   if (!row) return { text: 'That document is already gone.' };
   await StorageService.deleteFile(row).catch((e) => console.error('delete file (non-fatal):', e.message));
@@ -808,4 +963,4 @@ async function executeDelete(ctx, pending) {
   return { text: `Deleted *${pending.name}*.` };
 }
 
-module.exports = { answerGrounded, recordsFor, run, executeDelete, parseSaveStatements, cleanFields, impliedCall, TOOLS, toolDefs, PinRequired, resolveDoc };
+module.exports = { dataDeletion, parseLabelValue, clearFocus, parseCorrection, replaceFragment, answerGrounded, recordsFor, run, executeDelete, parseSaveStatements, cleanFields, impliedCall, TOOLS, toolDefs, PinRequired, resolveDoc };

@@ -527,7 +527,7 @@ const agentDeps = {
   v2Facts: (vault) => v2Facts(vault),
   formatEligibility: (r) => formatEligibility(r),
   setPending: (userId, action) => pendingActions.set(String(userId), { ...action, expiresAt: Date.now() + 2 * 60 * 1000 }),
-  lock: (userId) => { const id = String(userId); revealUntil.delete(id); awaitingPin.delete(id); pendingActions.delete(id); history.delete(id); closeVault(id); },
+  lock: (userId) => { const id = String(userId); agent.clearFocus(id); revealUntil.delete(id); awaitingPin.delete(id); pendingActions.delete(id); history.delete(id); closeVault(id); },
 };
 
 async function sendFile(msg, file) {
@@ -690,14 +690,16 @@ async function handleIncoming(msg, wa) {
     if (waiting && waiting.expiresAt <= Date.now()) pendingActions.delete(id);
     if (pendingActions.has(id)) {
       pendingActions.delete(id);
-      if (/^(yes|y|yep|yeah|confirm|delete it|sure|do it)$/i.test(text)) {
+      // Removing everything needs the exact phrase it asked for, not just a yes.
+      const confirmed = waiting.phrase ? text.trim().toLowerCase() === waiting.phrase : /^(yes|y|yep|yeah|confirm|delete it|sure|do it)$/i.test(text);
+      if (confirmed) {
         const entry = user.securityVersion === 2 ? vaultEntry(id) : null;
         if (!(user.securityVersion === 2 ? entry : revealActive(id))) { await msg.reply('Your session was locked, so I did not delete anything. Ask again and confirm your PIN.'); return; }
         await msg.reply((await agent.executeDelete({ user, entry }, waiting)).text);
         stats.answered += 1; stats.lastAnsweredAt = Date.now();
         return;
       }
-      if (/^(no|n|nope|cancel|keep|keep it|stop)$/i.test(text)) { await msg.reply('Okay, I kept it.'); return; }
+      if (/^(no|n|nope|cancel|keep|keep it|stop)$/i.test(text) || waiting.phrase) { await msg.reply('Okay, I did not delete anything.'); return; }
     }
 
     // A PIN is only ever read while a request for full details is waiting for it.
