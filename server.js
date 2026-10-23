@@ -148,6 +148,11 @@ const server = app.listen(PORT, () => {
     console.log('[storage] no object storage settings found, files are kept on this server');
   }
 
+  // Files that could not be removed when their document was deleted are retried here, so none stays in the bucket for good.
+  const sweep = () => require('./services/storageService').sweepRemovals().then((r) => { if (r.tried) console.log(`[storage] retried ${r.tried} file removal(s), ${r.removed} done`); }).catch((e) => console.error('[storage] removal retry failed:', e.message));
+  setTimeout(sweep, 20000).unref?.();
+  setInterval(sweep, 15 * 60 * 1000).unref?.();
+
   // The WhatsApp assistant reconnects on its own when a login is already saved.
   const whatsapp = require('./services/whatsappService');
   require('./services/whatsappBotService').attach(whatsapp);

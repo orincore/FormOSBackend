@@ -154,6 +154,52 @@ const StorageService = {
     }
   },
 
+  // The one way a document's file is removed when the document itself is deleted. It tries again a few times, and if the storage still
+  // cannot be reached it queues the file for a later retry instead of leaving it behind in the bucket for good. Returns true when the
+  // file is gone, false when it is queued. A file that is already missing counts as gone.
+  removeStored: async (document) => {
+    const target = { storageType: document.storageType, securityVersion: document.securityVersion, s3Key: document.s3Key, gridfsId: document.gridfsId, filePath: document.filePath };
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await StorageService.deleteFile(target);
+        return true;
+      } catch (error) {
+        if (error.code === 'ENOENT') return true;
+        lastError = error;
+        if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
+      }
+    }
+    try {
+      const StoredFileCleanup = require('../models/StoredFileCleanup');
+      await StoredFileCleanup.create({ ...target, securityVersion: target.securityVersion || 1, lastError: String(lastError?.message || lastError).slice(0, 200) });
+    } catch (queueError) {
+      console.error('Could not queue a stored file for removal:', target.s3Key || target.filePath, queueError.message);
+    }
+    console.error('Stored file could not be removed, queued to retry:', target.s3Key || target.filePath, lastError?.message);
+    return false;
+  },
+
+  // Retries the files that could not be removed earlier. Runs at start-up and on a timer.
+  sweepRemovals: async () => {
+    const StoredFileCleanup = require('../models/StoredFileCleanup');
+    const rows = await StoredFileCleanup.find({ attempts: { $lt: 50 } }).limit(100);
+    let removed = 0;
+    for (const row of rows) {
+      try {
+        await StorageService.deleteFile(row);
+        await row.deleteOne();
+        removed += 1;
+      } catch (error) {
+        if (error.code === 'ENOENT') { await row.deleteOne(); removed += 1; continue; }
+        row.attempts += 1;
+        row.lastError = String(error.message).slice(0, 200);
+        await row.save();
+      }
+    }
+    return { tried: rows.length, removed };
+  },
+
   // Stores an already-encrypted (Security V2) file: in Cloudflare R2 when it is set up, otherwise GridFS.
   // Only ciphertext may be passed in. Returns the fields to save on the document record.
   uploadEncrypted: async (buffer, mimeType, userId) => {

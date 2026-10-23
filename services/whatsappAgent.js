@@ -970,7 +970,7 @@ async function executeDelete(ctx, pending) {
   }
   const row = await Document.findOne({ _id: pending.docId, userId: ctx.user._id });
   if (!row) return { text: 'That document is already gone.' };
-  await StorageService.deleteFile(row).catch((e) => console.error('delete file (non-fatal):', e.message));
+  await StorageService.removeStored(row);
   await Document.deleteOne({ _id: row._id });
   if (ctx.entry) ctx.entry.data.docs = ctx.entry.data.docs.filter((d) => d.id !== String(row._id));
   return { text: `Deleted *${pending.name}*.` };

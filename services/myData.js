@@ -169,7 +169,7 @@ async function clearDocumentData(userId, docId) {
 }
 
 async function removeFile(doc) {
-  await StorageService.deleteFile(doc).catch((error) => console.error('Delete file (non-fatal):', error.message));
+  await StorageService.removeStored(doc);
 }
 
 // "Forget my details" removes the saved details (the profile and what was read from documents, keeping the files). "Everything"

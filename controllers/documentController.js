@@ -4,7 +4,7 @@ const os = require('os');
 const Document = require('../models/Document');
 const User = require('../models/User');
 const ocrService = require('../services/ocrService');
-const { isS3Configured, isR2Configured, downloadFromS3, deleteFromS3 } = require('../services/s3Service');
+const { isS3Configured, isR2Configured, downloadFromS3 } = require('../services/s3Service');
 const { maskSensitiveText, maskStructuredData } = require('../services/securityService');
 const StorageService = require('../services/storageService');
 const docFields = require('../services/documentFields');
@@ -632,20 +632,8 @@ exports.deleteDocument = async (req, res) => {
       });
     }
 
-    // Delete from S3, GridFS, or local filesystem
-    if (document.storageType === 'gridfs' || document.storageType === 'r2') {
-      await StorageService.deleteFile(document).catch((err) =>
-        console.error('Encrypted file delete error (non-fatal):', err.message)
-      );
-    } else if (document.storageType === 's3' && document.s3Key) {
-      await deleteFromS3(document.s3Key).catch((err) =>
-        console.error('S3 delete error (non-fatal):', err.message)
-      );
-    } else if (document.filePath) {
-      await fs.unlink(document.filePath).catch((err) =>
-        console.error('Local file delete error (non-fatal):', err.message)
-      );
-    }
+    // The stored file goes first (R2, S3, GridFS or disk). If the storage cannot be reached it is queued and retried, never forgotten.
+    await StorageService.removeStored(document);
 
     // Remove from DB
     await document.deleteOne();

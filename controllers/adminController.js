@@ -662,17 +662,7 @@ exports.deleteUser = async (req, res) => {
     let filesRemoved = 0;
     let fileErrors = 0;
     for (const document of documents) {
-      try {
-        await StorageService.deleteFile(document);
-        filesRemoved += 1;
-      } catch (error) {
-        if (error.code === 'ENOENT') {
-          filesRemoved += 1; // already gone, which is the outcome we wanted
-        } else {
-          fileErrors += 1;
-          console.error(`Admin delete: stored file for document ${document._id} could not be removed:`, error.message);
-        }
-      }
+      if (await StorageService.removeStored(document)) filesRemoved += 1; else fileErrors += 1; // a file that could not be removed is queued to retry
     }
 
     await Document.deleteMany({ userId: target._id });
@@ -705,13 +695,7 @@ exports.deleteUserDocument = async (req, res) => {
     const document = await Document.findOne({ _id: req.params.docId, userId: target._id });
     if (!document) return fail(res, 404, 'DOCUMENT_NOT_FOUND', 'Document not found.');
 
-    try {
-      await StorageService.deleteFile(document);
-    } catch (error) {
-      if (error.code !== 'ENOENT') {
-        console.error('Admin delete document: stored file could not be removed:', error.message);
-      }
-    }
+    await StorageService.removeStored(document);
     await document.deleteOne();
 
     await audit(req, 'document.deleted', target, { name: document.originalName, type: document.documentType });

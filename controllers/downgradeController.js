@@ -81,7 +81,7 @@ exports.finish = async (req, res) => {
     // Only now are the encrypted originals removed.
     let deleted = 0;
     for (const original of originals) {
-      await StorageService.deleteFile(original).catch((error) => console.error('Encrypted original delete (non-fatal):', error.message));
+      await StorageService.removeStored(original);
       await original.deleteOne();
       deleted += 1;
     }
