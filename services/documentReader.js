@@ -21,13 +21,13 @@ const TYPE_MAP = {
   aadhaar: 'aadhaar', pan: 'pan', passport: 'passport', license: 'license', driving_license: 'license', voter: 'voter', voter_id: 'voter',
   marksheet: 'marksheet', certificate: 'certificate', degree: 'certificate',
   credit_report: 'other', bank_statement: 'bank', bank: 'bank', payslip: 'other', insurance: 'insurance', vehicle_rc: 'vehicle', vehicle: 'vehicle',
-  invoice: 'other', other: 'other',
+  invoice: 'other', resume: 'resume', cv: 'resume', other: 'other',
 };
 
 const SYSTEM = `You are an expert at reading Indian identity, education, financial and other personal documents from a photo, scan or text, and turning them into complete, accurate structured data.
 Reply with ONLY one raw JSON object:
 {
- "documentType": one of aadhaar, pan, passport, driving_license, voter_id, marksheet, certificate, credit_report, bank_statement, payslip, insurance, vehicle_rc, invoice, other,
+ "documentType": one of aadhaar, pan, passport, driving_license, voter_id, marksheet, certificate, credit_report, bank_statement, payslip, insurance, vehicle_rc, invoice, resume, other,
  "documentTitle": "<short natural title, e.g. PAN Card, CBSE Class 12 Marksheet, CIBIL Credit Report, Electricity Bill>",
  "summary": "<one plain sentence saying what this document is and its most important facts, e.g. 'CIBIL credit report dated 18/10/2026 with a score of 742'>",
  "holder": { "fullName": "", "fatherName": "", "dateOfBirth": "DD/MM/YYYY", "gender": "Male|Female|Transgender", "address": "", "pincode": "", "state": "", "phone": "", "email": "" },
@@ -42,6 +42,10 @@ Rules:
 - "tables" must hold every table on the document, with ALL its rows and EVERY cell copied exactly, digit for digit (a subject-wise marks table, a list of accounts or loans, enquiries, transactions). "columns" are the headings as printed. "labelColumn" is the column that names the row (the subject, the lender, the date). Each row has one cell per column; use "" for an empty cell. Never skip rows, never reorder digits.
 - One row per THING, never one row per printed line. When a subject or course is printed on several lines (for example separate lines for its theory, practical, exam and internal marks) merge them into ONE row and add columns for each part, such as ["Course","Theory max","Theory obtained","Practical max","Practical obtained","Internal max","Internal obtained","Total","Credits"], or "ESE max/obtained" and "PA max/obtained". The first column is always the name of the thing (the course, the lender, the date), repeated for every line it covers, so the labelColumn is 0 and each name appears only once.
 - For a credit report always give fields for: the score (for example label "CIBIL Score"), score date, control or report number, report date, number of accounts, active and closed accounts, overdue amount, total outstanding, and enquiry counts, when they are printed.
+- A resume or CV (documentType "resume") is read for a hiring or eligibility check, so capture it completely, in tables and fields:
+  * "tables": one table "Experience" (columns Company, Role, From, To, Location, Details; labelColumn 0), one row per job or internship, in the order printed, with the dates exactly as printed (for example "Jun 2021" and "Present") and the responsibilities and achievements of that job in Details (up to 400 characters, keep numbers and technologies). One table "Education" (columns Qualification, Institution, From, To, Result), one row per qualification with the marks, percentage, CGPA or grade as printed. One table "Projects" (columns Project, Technologies, Details) and one table "Certifications" (columns Certification, Issuer, Year) when the resume has them.
+  * "fields": "Skills" (every skill listed, comma separated; when the resume groups skills under headings, one field per heading, for example "Programming languages", "Frameworks", "Cloud and tools"), "Languages known", "Links" (LinkedIn, GitHub, portfolio), "Location", "Total experience" only if the resume states it, "Objective" or "Summary" as printed, "Achievements" and anything else the resume has. Never leave out a job, a degree or a skill.
+  * "holder" has the person's name, phone, email and address as printed. Do not calculate years of experience: only copy the dates.
 - Always capture, as fields, who issued or produced the document (the board, university, bank, company or authority, with its full name), the document, reference or certificate number, and every date printed on it.
 - Never write an ID, account, card or phone number in documentTitle or summary (say "with an Aadhaar number", not the number): they are shown in lists.
 - Dates as DD/MM/YYYY. People's names in Title Case. Aadhaar as 12 digits, PAN as 10 characters.

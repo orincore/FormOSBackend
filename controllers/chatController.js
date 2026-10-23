@@ -16,6 +16,13 @@ exports.chat = async (req, res) => {
     // Get fresh user data
     const user = await User.findById(req.userId);
 
+    // A question about the member's own documents is answered from what was saved when they were added, the same way as on WhatsApp.
+    // Anything else (how to apply for something, what a form field means) falls through to the general assistant below.
+    if (user && user.securityVersion !== 2) {
+      const grounded = await require('../services/whatsappAgent').answerGrounded({ user }, message);
+      if (grounded?.found) return res.json({ success: true, response: grounded.text });
+    }
+
     // Attach recent completed document extractions so RAG has full context
     const recentDocs = await Document.find({
       userId: req.userId,

@@ -166,31 +166,8 @@ async function answerFromTextSearch(ctx, question) {
 // and figure) and answers ONLY from them. Aadhaar, PAN, passport and licence numbers are masked in what it sees, so it can never
 // repeat a full ID number; a request for the full number is handled by the PIN-checked tools. If the records do not hold the
 // answer it says so (NOTFOUND) and the caller decides what to say.
-const maskIds = (text) => String(text)
-  .replace(/\b\d{4}\s?\d{4}\s?\d{4}\b/g, (m) => `****${m.replace(/\s/g, '').slice(-4)}`)
-  .replace(/\b[A-Z]{5}\d{4}[A-Z]\b/g, (m) => `****${m.slice(-4)}`);
-
-async function recordsFor(ctx) {
-  const rows = await Document.find({ userId: ctx.user._id, securityVersion: { $ne: 2 }, ocrStatus: 'completed' })
-    .sort({ uploadedAt: -1 }).limit(25).select('originalName uploadedAt structuredData').lean();
-  let total = 0;
-  const blocks = [];
-  const profile = ctx.user.extractedData || {};
-  const profileLines = Object.keys(FIELD_LABEL).filter((k) => profile[k]).map((k) => `${FIELD_LABEL[k]}: ${SENSITIVE.has(k) ? `****${String(profile[k]).replace(/[^A-Za-z0-9]/g, '').slice(-4)}` : maskIds(String(profile[k]).slice(0, 300))}`);
-  if (ctx.user.name || profileLines.length) blocks.push(['Account profile (the person asking)', ctx.user.name ? `Account name: ${ctx.user.name}` : '', ...profileLines].filter(Boolean).join('\n'));
-  rows.forEach((d, i) => {
-    const sd = docFields.cleanKnown(d.structuredData || {});
-    const lines = Object.entries(sd)
-      .filter(([k, v]) => !docFields.HIDDEN_KEYS.has(k) && !docFields.ALIAS_KEYS.has(k) && v !== '' && v != null)
-      .map(([k, v]) => `${docFields.labelOf(k)}: ${SENSITIVE.has(k) ? `****${String(v).replace(/[^A-Za-z0-9]/g, '').slice(-4)}` : maskIds(String(v).slice(0, 400))}`);
-    const head = `Document ${i + 1}: ${maskIds(sd.documentTitle || '') || TYPE_LABEL[sd.documentType] || d.originalName} (file ${d.originalName}, added ${new Date(d.uploadedAt).toLocaleDateString('en-GB')})`;
-    const block = [head, sd.documentSummary ? `Summary: ${maskIds(sd.documentSummary)}` : '', ...lines].filter(Boolean).join('\n');
-    if (total + block.length > 40000) return;
-    total += block.length;
-    blocks.push(block);
-  });
-  return blocks;
-}
+const documentRecords = require('./documentRecords');
+const recordsFor = (ctx) => documentRecords.recordsFor(ctx.user);
 
 async function answerGrounded(ctx, question) {
   if (ctx.user.securityVersion === 2 || !aiService.isConfigured()) return null;

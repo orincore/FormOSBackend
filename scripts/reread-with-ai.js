@@ -15,7 +15,9 @@ const { reprocessDocument } = require('../controllers/documentController');
 (async () => {
   const apply = process.argv.includes('--apply');
   const at = process.argv.indexOf('--email');
-  const query = { securityVersion: { $ne: 2 }, aiReadAt: { $exists: false }, mimeType: { $in: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'] } };
+  // --resumes: read again the documents that were saved as a resume before resumes were captured in full
+  const resumes = process.argv.includes('--resumes');
+  const query = resumes ? { securityVersion: { $ne: 2 }, 'structuredData.documentTitle': /resume|curriculum vitae|\bcv\b/i, mimeType: { $in: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'] } } : { securityVersion: { $ne: 2 }, aiReadAt: { $exists: false }, mimeType: { $in: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'] } };
   await mongoose.connect(process.env.MONGODB_URI || process.env.MONGO_URI);
   if (at !== -1) {
     const user = await User.findOne({ email: String(process.argv[at + 1] || '').toLowerCase() }).select('_id');

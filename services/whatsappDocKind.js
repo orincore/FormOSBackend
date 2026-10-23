@@ -8,6 +8,7 @@ const KINDS = {
   license: { label: 'Driving licence', words: /licen[cs]e|\bdl\b|driving/i },
   voter: { label: 'Voter ID card', words: /voter|\bepic\b|election card|electors?\b/i },
   vehicle: { label: 'Vehicle registration (RC)', words: /\brc\b|registration certificate|certificate of registration|rc book|vehicle/i },
+  resume: { label: 'Resume', words: /resume|curriculum vitae|\bcv\b/i },
   marksheet: { label: 'Marksheet', words: /mark\s*-?sheet|statement of marks|grade ?card|report card|result|\b(?:10th|12th|ssc|hsc|cbse|icse)\b/i },
   marriage: { label: 'Marriage certificate', words: /marriage|wedding/i },
   birth: { label: 'Birth certificate', words: /birth certificate/i },
@@ -16,7 +17,7 @@ const KINDS = {
   insurance: { label: 'Insurance document', words: /insurance|policy/i },
 };
 // The order matters: "registration certificate" is a vehicle paper, not just a certificate.
-const ORDER = ['passport', 'aadhaar', 'pan', 'license', 'voter', 'vehicle', 'marksheet', 'bank', 'insurance', 'marriage', 'birth', 'certificate'];
+const ORDER = ['resume', 'passport', 'aadhaar', 'pan', 'license', 'voter', 'vehicle', 'marksheet', 'bank', 'insurance', 'marriage', 'birth', 'certificate'];
 
 const kindOf = (key, labelOverride) => (KINDS[key] ? { key, label: labelOverride || KINDS[key].label } : null);
 
@@ -37,6 +38,7 @@ const SIGNS = {
   license: [[3, /driving licen[cs]e/i], [3, /motor driving/i], [2, /\bDL\s*(?:no|number)\b/i], [2, /\bcov\b|class of vehicle|authori[sz]ation to drive/i], [1, /valid till|validity/i], [1, /blood group/i], [1, /\bform\s*7\b/i]],
   voter: [[3, /election commission/i], [3, /elector'?s? (?:photo )?identity|electors? name|\bepic\b/i], [2, /assembly constituency|electoral registration/i], [1, /voter/i]],
   vehicle: [[3, /certificate of registration|registration certificate/i], [3, /chassis no|engine no/i], [2, /regn\.? ?(?:no|date)|registration (?:no|date)/i], [2, /fuel type|seating capacity|manufactur/i], [1, /owner'?s? name/i]],
+  resume: [[3, /curriculum vitae|\bresume\b/i], [3, /(?:work|professional) experience|employment history/i], [2, /\bskills\b/i], [2, /\beducation\b/i], [1, /\bprojects?\b|certifications?|objective/i]],
   marksheet: [[3, /statement of marks|mark\s*-?sheet|grade ?card|report card/i], [2, /seat\s*no/i], [2, /total marks|marks obtained|percentage/i], [2, /subject (?:code|name)/i], [1, /examination|board of (?:secondary )?education/i], [1, /\b(?:result|grade|division)\b/i]],
   bank: [[3, /pass\s*book|statement of account/i], [2, /\bifsc\b/i], [2, /account (?:no|number)|a\/c no/i], [1, /\bbranch\b|\bbank\b/i], [1, /\bcheque\b|balance/i]],
   insurance: [[3, /insurance/i], [2, /policy (?:no|number)/i], [2, /sum assured|premium/i], [1, /nominee|insured/i]],

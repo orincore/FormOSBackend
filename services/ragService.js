@@ -103,6 +103,8 @@ ANSWER:`;
     const show = (value) => (reveal ? value : `****${String(value).slice(-4)}`);
     const question = String(userQuestion || '').trim().toLowerCase();
     if (!question) return null;
+    // "How do I apply for a PAN card?" is a how-to question, not a request for the member's own PAN: no shortcut answer.
+    if (/\b(how|where|steps?|process|procedure|apply|applying|renew|register|download)\b/.test(question) && /\b(to|do i|can i|should i|does)\b/.test(question) && !/\bmy\b/.test(question)) return null;
 
     const profile = this.getNormalizedProfile(userData);
     const isNameQuestion = /\b(what('?s| is)?\s+my\s+name|my\s+name)\b/.test(question);

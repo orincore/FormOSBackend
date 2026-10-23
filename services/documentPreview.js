@@ -9,14 +9,14 @@ const { maskSensitiveText } = require('./securityService');
 
 const KIND_LABEL = {
   aadhaar: 'Aadhaar card', pan: 'PAN card', passport: 'Passport', license: 'Driving licence', voter: 'Voter ID',
-  marksheet: 'Marksheet', certificate: 'Certificate', bank: 'Bank document', vehicle: 'Vehicle registration', insurance: 'Insurance',
+  marksheet: 'Marksheet', resume: 'Resume', certificate: 'Certificate', bank: 'Bank document', vehicle: 'Vehicle registration', insurance: 'Insurance',
 };
 // The number printed on each kind of ID, whose last four digits are shown on its card.
 const ID_FIELD = { aadhaar: 'aadhaarNumber', pan: 'panNumber', passport: 'passportNumber', license: 'drivingLicenseNumber' };
 const TOP_LEVEL = new Set(['aadhaar', 'pan', 'passport', 'license']);
 
 // Facts worth showing on a card, best first. Anything long, or that looks like a personal number, is left out.
-const FACT_PRIORITY = [/score/i, /percentage|percent|cgpa|gpa|grade|class awarded/i, /^result$|status/i, /total|aggregate|balance|outstanding|amount|limit/i, /valid|expiry|expires|due/i, /date|issued|year|exam/i, /seat|roll|enrol|policy|account|number|no$/i];
+const FACT_PRIORITY = [/total.?experience|experience/i, /^skills?$|skill/i, /score/i, /percentage|percent|cgpa|gpa|grade|class awarded/i, /^result$|status/i, /total|aggregate|balance|outstanding|amount|limit/i, /valid|expiry|expires|due/i, /date|issued|year|exam/i, /seat|roll|enrol|policy|account|number|no$/i];
 const SKIP_FACT = /control|enrol|aadhaar|pan\b|passport|licen[cs]e|account\s*number|phone|mobile|email|address|pincode|zip/i;
 
 const last4 = (value) => {

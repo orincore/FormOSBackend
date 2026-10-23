@@ -95,10 +95,11 @@ Do not assume the candidate holds any document, qualification, job, address or a
   if (user.extractedData?.state) context += `State: ${user.extractedData.state}\n`;
   if (user.extractedData?.gender) context += `Gender: ${user.extractedData.gender}\n`;
 
-  const docs = await Document.find({ userId: user._id, securityVersion: { $ne: 2 } }).select('documentType originalName structuredData').limit(20).lean();
-  if (docs.length) {
-    context += '\nDocuments the candidate has uploaded:\n';
-    docs.forEach((doc) => { context += `- ${DOC_LABELS[doc.documentType] || 'Document'}: ${doc.originalName}\n`; });
+  // Everything saved from the member's documents: a resume (jobs with dates, education, skills, projects), marksheets, certificates,
+  // IDs (numbers masked) and so on. This is what a job or scheme is judged against, not just the names of the files.
+  const blocks = await require('../services/documentRecords').recordsFor(user, { profile: false, maxChars: 30000 });
+  if (blocks.length) {
+    context += '\nDocuments the candidate has uploaded, with everything that was read from each:\n\n' + blocks.join('\n\n') + '\n';
   } else {
     context += '\nDocuments uploaded: none.\n';
   }
@@ -116,10 +117,13 @@ async function evaluateEligibility(user, jd, extra = {}) {
 First detect the opportunity type, then evaluate the candidate profile against the requirements.
 
 GROUNDING RULES:
-- Use ONLY facts written in CANDIDATE PROFILE. If a fact is not there, it is unknown: never say the candidate has or lacks something unless the profile shows it.
+- Use ONLY facts written in CANDIDATE PROFILE (the profile lines and the documents with everything read from them). If a fact is not there, it is unknown: never say the candidate has or lacks something unless the profile shows it.
 - Something unknown goes in missingRequirements with a suggestion to provide or confirm it. Do not list it under strengths.
 - A requirement the profile clearly satisfies (for example age, state, document held) goes in strengths and must NOT appear in missingRequirements.
 - Compare numbers yourself: use the Age line for age limits, the Address and State lines for location.
+- Today's date is ${new Date().toLocaleDateString('en-GB')}.
+- For a JOB: judge it against the resume and the other documents. Skills: compare each required skill with the Skills lines, the jobs and the projects (a skill used in a project or job counts). Experience: work out the years from the From and To dates of the jobs (a job that says Present runs to today; add the jobs up and do not double count overlaps) and say the figure you found. Education: compare the required degree, field and minimum marks with the Education entries, marksheets and certificates. Certifications, languages and location likewise. A requirement the documents do not mention is unknown, not failed.
+- Name the document a fact comes from in the strengths and the missing list, for example "5 years of experience (Resume: Infosys 06/2021 to Present)".
 
 CRITICAL: Output ONLY a raw JSON object. No thinking. No explanation. No markdown. No backticks. Start your response with { and end with }. Nothing before or after.
 
@@ -155,7 +159,14 @@ JSON:`;
   let result = null;
   let lastResponse = '';
   for (let attempt = 1; attempt <= 2 && !result; attempt++) {
-    const aiResponse = await aiService.chat(systemPrompt, userPrompt, options);
+    let aiResponse;
+    try {
+      // Judging a candidate against a job is careful work (dates, sums, many records): the stronger model does it.
+      aiResponse = await aiService.chatVision([{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }], { ...options, model: process.env.AI_ANSWER_MODEL || 'openai/gpt-4o', maxTokens: 1800, timeout: 60000 });
+    } catch (error) {
+      if (error.name === 'AIPolicyViolationError') throw error;
+      aiResponse = await aiService.chat(systemPrompt, userPrompt, options);
+    }
     if (!aiResponse) continue;
     lastResponse = aiResponse;
     result = normalizeResult(extractResult(aiResponse));
