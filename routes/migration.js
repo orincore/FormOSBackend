@@ -26,6 +26,8 @@ router.post('/failed', authMiddleware, retired);
 const downgrade = require('../controllers/downgradeController');
 const requireStepUp = require('../middleware/requireStepUp');
 router.get('/downgrade/status', authMiddleware, downgrade.status);
+// A quick check that the recent re-authentication is in place, so the app can ask for it before the move starts.
+router.get('/downgrade/ready', authMiddleware, requireStepUp, (req, res) => res.json({ success: true }));
 router.post('/downgrade/copy', authMiddleware, requireStepUp, upload.single('document'), downgrade.receiveCopy);
 router.post('/downgrade/finish', authMiddleware, requireStepUp, downgrade.finish);
 
